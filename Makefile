@@ -7,7 +7,7 @@ PYTHON ?= python3
 
 BUILD := build
 EFI := $(BUILD)/esp/EFI/BOOT/BOOTX64.EFI
-OBJECTS := $(BUILD)/boot/main.obj $(BUILD)/boot/serial.obj
+OBJECTS := $(BUILD)/boot/main.obj
 CFLAGS := --no-default-config --target=x86_64-pc-windows-msvc -std=c17 \
           -ffreestanding -fno-builtin -fno-stack-protector \
           -mno-stack-arg-probe -mno-red-zone -mgeneral-regs-only \
@@ -45,8 +45,8 @@ clean:
 
 help:
 	@echo 'make build   Build the x86_64 UEFI serial probe (C)'
-	@echo 'make run     Boot QEMU; quit with Ctrl-a x'
-	@echo 'make test    Check boot and serial input/output (60s timeout)'
+	@echo 'make run     Boot the UEFI Serial IO probe; quit with Ctrl-a x'
+	@echo 'make test    Check UEFI Serial IO input/output (60s timeout)'
 	@echo 'make debug   GDB stdio transport; see README before using'
 	@echo 'make doctor  Check tools and firmware paths'
 	@echo 'make clean   Remove generated files'

@@ -106,7 +106,7 @@ def smoke_test(arguments, timeout):
     log_path = BUILD / "serial-test.log"
     nonce = ("serial-" + uuid.uuid4().hex).encode("ascii")
     transcript = bytearray()
-    sent = False
+    stage = 0
     passed = False
     deadline = time.monotonic() + timeout
     with log_path.open("wb") as log, subprocess.Popen(
@@ -124,19 +124,25 @@ def smoke_test(arguments, timeout):
                         log.write(data)
                         log.flush()
                         transcript.extend(data)
-                    if not sent and b"BOOT: UEFI x86_64 C entry\r\n" in transcript and b"SERIAL> " in transcript:
-                        process.stdin.write(nonce + b"\r")
-                        process.stdin.flush()
-                        sent = True
-                    if sent and nonce + b"\r\nSERIAL> " in transcript:
+                    outgoing = None
+                    if b"BOOT ERROR:" in transcript:
+                        raise RuntimeError("UEFI application reported an error; see serial log.")
+                    if stage == 0 and b"BOOT: EFI_SERIAL_IO_PROTOCOL via LocateProtocol\r\n" in transcript and b"SERIAL> " in transcript:
+                        outgoing = nonce + b"\r"
+                    elif stage == 1 and nonce + b"\r\nSERIAL> " in transcript:
                         passed = True
                         break
+                    if outgoing is not None:
+                        process.stdin.write(outgoing)
+                        process.stdin.flush()
+                        transcript.clear()
+                        stage += 1
                 if not passed:
-                    raise RuntimeError(f"Boot/serial test timed out after {timeout:g}s.")
+                    raise RuntimeError(f"UEFI Serial IO test timed out after {timeout:g}s (stage {stage}/1).")
         finally:
             stop(process)
             print(f"Serial log: {log_path}")
-    print("PASS: x86_64 UEFI C entry and serial input/output")
+    print("PASS: UEFI Serial IO protocol discovery and serial input/output")
 
 
 def main():
@@ -158,7 +164,8 @@ def main():
         print("Guest: x86_64 / q35 / TCG / 1 CPU / 256 MiB / COM1")
         return 0
 
-    if not (BUILD / "esp/EFI/BOOT/BOOTX64.EFI").is_file():
+    application = BUILD / "esp/EFI/BOOT/BOOTX64.EFI"
+    if not application.is_file():
         raise RuntimeError("BOOTX64.EFI is missing; run make build first.")
     # Each VM owns a copy. Firmware templates and build output stay read-only.
     with tempfile.TemporaryDirectory(prefix="os-by-ai-") as temporary:
@@ -166,7 +173,9 @@ def main():
         vars_copy = directory / "vars.fd"
         shutil.copyfile(variables, vars_copy)
         esp = directory / "esp"
-        shutil.copytree(BUILD / "esp", esp)
+        boot_directory = esp / "EFI/BOOT"
+        boot_directory.mkdir(parents=True)
+        shutil.copyfile(application, boot_directory / application.name)
         arguments = command(qemu, code, vars_copy, esp, args.mode)
         if args.mode == "test":
             smoke_test(arguments, args.timeout)
