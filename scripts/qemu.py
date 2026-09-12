@@ -82,6 +82,8 @@ def command(qemu, code, variables, esp, mode):
             "-serial", f"file:{BUILD / 'serial-debug.log'}",
             "-S", "-gdb", "stdio",
         ]
+    elif mode == "test":
+        result += ["-monitor", "none", "-qmp", "stdio"]
     else:
         result += ["-serial", "mon:stdio"]
     return result
@@ -106,7 +108,9 @@ def main():
         parser.error("--timeout must be positive and finite")
 
     if args.mode == "test":
-        raise RuntimeError("Kernel boot test is pending ELF loading; use make test for build verification.")
+        from test_boot import test_all
+        test_all(args.timeout)
+        return 0
 
     qemu = qemu_path()
     code, variables = firmware(qemu)

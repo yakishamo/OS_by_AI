@@ -8,8 +8,8 @@ PYTHON ?= python3
 BUILD := build
 EFI := $(BUILD)/esp/EFI/BOOT/BOOTX64.EFI
 KERNEL := $(BUILD)/esp/kernel.elf
-BOOT_OBJECTS := $(BUILD)/boot/main.obj
-KERNEL_OBJECTS := $(BUILD)/kernel/main.o
+BOOT_OBJECTS := $(BUILD)/boot/main.obj $(BUILD)/boot/load.obj
+KERNEL_OBJECTS := $(BUILD)/kernel/entry.o $(BUILD)/kernel/main.o
 OBJECTS := $(BOOT_OBJECTS) $(KERNEL_OBJECTS)
 COMMON_CFLAGS := -std=c17 -ffreestanding -fno-builtin -fno-stack-protector \
                  -mno-red-zone -mgeneral-regs-only -Wall -Wextra -Werror -O2 -g -MMD -MP
@@ -34,6 +34,10 @@ $(BUILD)/kernel/%.o: kernel/%.c Makefile
 	@mkdir -p $(@D)
 	$(CLANG) $(KERNEL_CFLAGS) -c $< -o $@
 
+$(BUILD)/kernel/%.o: kernel/%.S Makefile
+	@mkdir -p $(@D)
+	$(CLANG) --no-default-config --target=x86_64-unknown-none-elf -g -MMD -MP -c $< -o $@
+
 $(KERNEL): $(KERNEL_OBJECTS) kernel/linker.ld Makefile
 	@mkdir -p $(@D)
 	$(LLD) -flavor gnu -m elf_x86_64 -static -T kernel/linker.ld -o $@ $(KERNEL_OBJECTS)
@@ -48,6 +52,7 @@ run: build
 
 test: build
 	$(PYTHON) scripts/check_build.py
+	$(PYTHON) scripts/qemu.py test
 
 debug: build
 	@$(PYTHON) scripts/qemu.py debug
@@ -62,8 +67,8 @@ clean:
 
 help:
 	@echo 'make build   Build the UEFI loader and minimal C kernel'
-	@echo 'make run     Boot loader only (kernel loading pending)'
-	@echo 'make test    Verify separate PE/COFF loader and ELF64 kernel'
+	@echo 'make run     Load kernel.elf and boot the kernel'
+	@echo 'make test    Verify artifacts, kernel halt and loader error cases'
 	@echo 'make debug   GDB stdio transport; see README before using'
 	@echo 'make doctor  Check tools and firmware paths'
 	@echo 'make clean   Remove generated files'

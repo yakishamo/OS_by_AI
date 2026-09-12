@@ -16,6 +16,8 @@ typedef void *EFI_HANDLE;
 #define EFI_DEVICE_ERROR (EFI_ERROR_BIT | 7)
 #define EFI_INVALID_PARAMETER (EFI_ERROR_BIT | 2)
 #define EFI_TIMEOUT (EFI_ERROR_BIT | 18)
+#define EFI_LOAD_ERROR (EFI_ERROR_BIT | 1)
+#define EFI_UNSUPPORTED (EFI_ERROR_BIT | 3)
 
 typedef struct {
     uint32_t Data1;
@@ -32,14 +34,17 @@ typedef void (EFIAPI *EFI_UNUSED_SERVICE)(void);
 typedef struct {
     EFI_TABLE_HEADER Hdr;
     EFI_UNUSED_SERVICE RaiseTPL, RestoreTPL;
-    EFI_UNUSED_SERVICE AllocatePages, FreePages;
+    EFI_STATUS (EFIAPI *AllocatePages)(uint32_t Type, uint32_t MemoryType, uintptr_t Pages, uint64_t *Memory);
+    EFI_STATUS (EFIAPI *FreePages)(uint64_t Memory, uintptr_t Pages);
     EFI_STATUS (EFIAPI *GetMemoryMap)(uintptr_t *MemoryMapSize, void *MemoryMap,
                                       uintptr_t *MapKey, uintptr_t *DescriptorSize,
                                       uint32_t *DescriptorVersion);
-    EFI_UNUSED_SERVICE AllocatePool, FreePool;
+    EFI_STATUS (EFIAPI *AllocatePool)(uint32_t PoolType, uintptr_t Size, void **Buffer);
+    EFI_STATUS (EFIAPI *FreePool)(void *Buffer);
     EFI_UNUSED_SERVICE CreateEvent, SetTimer, WaitForEvent, SignalEvent, CloseEvent, CheckEvent;
     EFI_UNUSED_SERVICE InstallProtocolInterface, ReinstallProtocolInterface;
-    EFI_UNUSED_SERVICE UninstallProtocolInterface, HandleProtocol;
+    EFI_UNUSED_SERVICE UninstallProtocolInterface;
+    EFI_STATUS (EFIAPI *HandleProtocol)(EFI_HANDLE Handle, EFI_GUID *Protocol, void **Interface);
     void *Reserved;
     EFI_UNUSED_SERVICE RegisterProtocolNotify, LocateHandle, LocateDevicePath;
     EFI_UNUSED_SERVICE InstallConfigurationTable, LoadImage, StartImage, Exit;
@@ -77,6 +82,34 @@ typedef struct {
     uintptr_t NumberOfTableEntries;
     void *ConfigurationTable;
 } EFI_SYSTEM_TABLE;
+
+/* Only the prefixes used by the loader are declared. */
+typedef struct {
+    uint32_t Revision;
+    EFI_HANDLE ParentHandle;
+    EFI_SYSTEM_TABLE *SystemTable;
+    EFI_HANDLE DeviceHandle;
+} EFI_LOADED_IMAGE_PROTOCOL;
+
+typedef struct EFI_FILE_PROTOCOL EFI_FILE_PROTOCOL;
+struct EFI_FILE_PROTOCOL {
+    uint64_t Revision;
+    EFI_STATUS (EFIAPI *Open)(EFI_FILE_PROTOCOL *, EFI_FILE_PROTOCOL **, uint16_t *, uint64_t, uint64_t);
+    EFI_STATUS (EFIAPI *Close)(EFI_FILE_PROTOCOL *);
+    EFI_UNUSED_SERVICE Delete;
+    EFI_STATUS (EFIAPI *Read)(EFI_FILE_PROTOCOL *, uintptr_t *, void *);
+    EFI_UNUSED_SERVICE Write;
+    EFI_STATUS (EFIAPI *GetPosition)(EFI_FILE_PROTOCOL *, uint64_t *);
+    EFI_STATUS (EFIAPI *SetPosition)(EFI_FILE_PROTOCOL *, uint64_t);
+};
+typedef struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL EFI_SIMPLE_FILE_SYSTEM_PROTOCOL;
+struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL {
+    uint64_t Revision;
+    EFI_STATUS (EFIAPI *OpenVolume)(EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *, EFI_FILE_PROTOCOL **);
+};
+_Static_assert(offsetof(EFI_LOADED_IMAGE_PROTOCOL, DeviceHandle) == 24, "Loaded image ABI");
+_Static_assert(offsetof(EFI_FILE_PROTOCOL, Read) == 32, "File Read ABI");
+_Static_assert(offsetof(EFI_FILE_PROTOCOL, SetPosition) == 56, "File SetPosition ABI");
 
 typedef enum { DefaultParity, NoParity, EvenParity, OddParity, MarkParity, SpaceParity } EFI_PARITY_TYPE;
 typedef enum { DefaultStopBits, OneStopBit, OneFiveStopBits, TwoStopBits } EFI_STOP_BITS_TYPE;

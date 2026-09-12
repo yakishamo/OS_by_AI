@@ -1,4 +1,7 @@
-#include "efi.h"
+#include "load.h"
+#include "../include/boot_info.h"
+
+volatile EFI_STATUS boot_exit_failure;
 
 /* Serial may be unavailable: report failures through the UEFI text console. */
 static EFI_STATUS report_error(EFI_SYSTEM_TABLE *table, const char *operation, EFI_STATUS status)
@@ -23,7 +26,6 @@ static EFI_STATUS report_error(EFI_SYSTEM_TABLE *table, const char *operation, E
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_table)
 {
-    (void)image_handle;
     EFI_BOOT_SERVICES *services = system_table->BootServices;
     /* Disable the firmware watchdog before handing control to the kernel. */
     EFI_STATUS status = services->SetWatchdogTimer(0, 0, 0, NULL);
@@ -52,7 +54,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
         "\r\nBOOT: UEFI x86_64 C entry\r\n"
         "BOOT: EFI_SERIAL_IO_PROTOCOL via LocateProtocol\r\n"
         "BOOT: serial ready (115200 8N1)\r\n"
-        "BOOT: kernel.elf loading not implemented yet\r\n";
+        "BOOT: loading kernel.elf\r\n";
     uintptr_t size = sizeof(banner) - 1;
     status = serial->Write(serial, &size, banner);
     if (!EFI_ERROR(status) && size != sizeof(banner) - 1) {
@@ -62,8 +64,75 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
         return report_error(system_table, "Serial IO Write", status);
     }
 
-    /* Build split only: remain in UEFI until the ELF loader is implemented. */
-    for (;;) {
-        services->Stall(1000000);
+    LOADED_KERNEL kernel;
+    status = load_kernel(services, image_handle, &kernel);
+    if (EFI_ERROR(status)) return report_error(system_table, "load kernel.elf", status);
+
+    char entry[] = "BOOT: kernel entry=0x0000000000000000\r\n";
+    const char digits[] = "0123456789abcdef";
+    for (unsigned i = 0; i < 16; ++i)
+        entry[sizeof("BOOT: kernel entry=0x") - 1 + i] = digits[(kernel.entry >> ((15 - i) * 4)) & 15];
+    size = sizeof(entry) - 1;
+    status = serial->Write(serial, &size, entry);
+    if (EFI_ERROR(status) || size != sizeof(entry) - 1) {
+        services->FreePages(kernel.base, kernel.pages);
+        return report_error(system_table, "Serial IO Write", EFI_ERROR(status) ? status : EFI_DEVICE_ERROR);
     }
+
+    /* One owned allocation: information page + 64 KiB map + 64 KiB stack.
+     * All remain EfiLoaderData in the final map; the kernel must retain them.
+     */
+    const uintptr_t handoff_pages = 33;
+    const uintptr_t map_capacity = 16 * 4096;
+    uint64_t handoff_base = 0;
+    status = services->AllocatePages(0, 2, handoff_pages, &handoff_base);
+    if (EFI_ERROR(status)) {
+        services->FreePages(kernel.base, kernel.pages);
+        return report_error(system_table, "AllocatePages(boot information)", status);
+    }
+    volatile uint8_t *clear = (void *)(uintptr_t)handoff_base;
+    for (uintptr_t i = 0; i < handoff_pages * 4096; ++i) clear[i] = 0;
+    BOOT_INFO *info = (void *)(uintptr_t)handoff_base;
+    info->magic = BOOT_INFO_MAGIC;
+    info->version = BOOT_INFO_VERSION;
+    info->size = sizeof(*info);
+    info->memory_map = handoff_base + 4096;
+    info->kernel_base = kernel.base;
+    info->kernel_size = kernel.pages * 4096;
+    info->stack_base = info->memory_map + map_capacity;
+    info->stack_size = 16 * 4096;
+
+    /* Only the final GetMemoryMap and ExitBootServices calls follow. */
+    uintptr_t map_key, descriptor_size;
+    uint32_t descriptor_version;
+    for (unsigned attempt = 0; attempt < 8; ++attempt) {
+        size = map_capacity;
+        status = services->GetMemoryMap(&size, (void *)(uintptr_t)info->memory_map, &map_key, &descriptor_size, &descriptor_version);
+        if (EFI_ERROR(status)) {
+            if (attempt == 0) {
+                services->FreePages(handoff_base, handoff_pages);
+                services->FreePages(kernel.base, kernel.pages);
+                return report_error(system_table, "GetMemoryMap", status);
+            }
+            break;
+        }
+        info->memory_map_size = size;
+        info->descriptor_size = descriptor_size;
+        info->descriptor_version = descriptor_version;
+        status = services->ExitBootServices(image_handle, map_key);
+        if (status == EFI_SUCCESS) {
+            info->flags = BOOT_SERVICES_EXITED;
+            typedef void (__attribute__((sysv_abi)) *KERNEL_ENTRY)(const BOOT_INFO *, uint64_t);
+            __asm__ volatile ("cli" : : : "memory");
+            ((KERNEL_ENTRY)(uintptr_t)kernel.entry)(info, info->stack_base + info->stack_size);
+            /* A kernel must never return to retired boot services. */
+            status = EFI_LOAD_ERROR;
+            break;
+        }
+        if (status != EFI_INVALID_PARAMETER) break;
+    }
+    /* After an attempted exit firmware may be partially shut down. */
+    boot_exit_failure = status;
+    __asm__ volatile ("cli" : : : "memory");
+    for (;;) __asm__ volatile ("pause");
 }

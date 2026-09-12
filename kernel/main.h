@@ -1,6 +1,9 @@
 #ifndef KERNEL_MAIN_H
 #define KERNEL_MAIN_H
 
-_Noreturn void kernel_main(void);
+#include "../include/boot_info.h"
+
+_Noreturn void kernel_main(const BOOT_INFO *info);
+_Noreturn void kernel_halt(void);
 
 #endif
