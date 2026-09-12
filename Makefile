@@ -7,30 +7,47 @@ PYTHON ?= python3
 
 BUILD := build
 EFI := $(BUILD)/esp/EFI/BOOT/BOOTX64.EFI
-OBJECTS := $(BUILD)/boot/main.obj $(BUILD)/kernel/main.obj
-CFLAGS := --no-default-config --target=x86_64-pc-windows-msvc -std=c17 \
-          -ffreestanding -fno-builtin -fno-stack-protector \
-          -mno-stack-arg-probe -mno-red-zone -mgeneral-regs-only \
-          -Wall -Wextra -Werror -O2 -g -MMD -MP
+KERNEL := $(BUILD)/esp/kernel.elf
+BOOT_OBJECTS := $(BUILD)/boot/main.obj
+KERNEL_OBJECTS := $(BUILD)/kernel/main.o
+OBJECTS := $(BOOT_OBJECTS) $(KERNEL_OBJECTS)
+COMMON_CFLAGS := -std=c17 -ffreestanding -fno-builtin -fno-stack-protector \
+                 -mno-red-zone -mgeneral-regs-only -Wall -Wextra -Werror -O2 -g -MMD -MP
+KERNEL_CFLAGS := --no-default-config --target=x86_64-unknown-none-elf \
+                 $(COMMON_CFLAGS) -fno-pic -fno-pie -fno-asynchronous-unwind-tables
+CFLAGS := --no-default-config --target=x86_64-pc-windows-msvc \
+          $(COMMON_CFLAGS) -mno-stack-arg-probe
 
 .PHONY: all build run test debug doctor clean help
 all: build
-build: $(EFI)
+build: $(EFI) $(KERNEL)
+
+.PHONY: loader kernel
+loader: $(EFI)
+kernel: $(KERNEL)
 
 $(BUILD)/%.obj: %.c Makefile
 	@mkdir -p $(@D)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
-$(EFI): $(OBJECTS) Makefile
+$(BUILD)/kernel/%.o: kernel/%.c Makefile
+	@mkdir -p $(@D)
+	$(CLANG) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(KERNEL): $(KERNEL_OBJECTS) kernel/linker.ld Makefile
+	@mkdir -p $(@D)
+	$(LLD) -flavor gnu -m elf_x86_64 -static -T kernel/linker.ld -o $@ $(KERNEL_OBJECTS)
+
+$(EFI): $(BOOT_OBJECTS) Makefile
 	@mkdir -p $(@D)
 	$(LLD) -flavor link /machine:x64 /subsystem:efi_application \
-		/entry:efi_main /nodefaultlib /debug:dwarf /out:$@ $(OBJECTS)
+		/entry:efi_main /nodefaultlib /debug:dwarf /out:$@ $(BOOT_OBJECTS)
 
 run: build
 	$(PYTHON) scripts/qemu.py run
 
 test: build
-	$(PYTHON) scripts/qemu.py test
+	$(PYTHON) scripts/check_build.py
 
 debug: build
 	@$(PYTHON) scripts/qemu.py debug
@@ -45,10 +62,10 @@ clean:
 
 help:
 	@echo 'make build   Build the UEFI loader and minimal C kernel'
-	@echo 'make run     Boot the kernel; quit with Ctrl-a x'
-	@echo 'make test    Verify kernel HLT and interrupts disabled (60s timeout)'
+	@echo 'make run     Boot loader only (kernel loading pending)'
+	@echo 'make test    Verify separate PE/COFF loader and ELF64 kernel'
 	@echo 'make debug   GDB stdio transport; see README before using'
 	@echo 'make doctor  Check tools and firmware paths'
 	@echo 'make clean   Remove generated files'
 
--include $(OBJECTS:.obj=.d)
+-include $(BOOT_OBJECTS:.obj=.d) $(KERNEL_OBJECTS:.o=.d)
