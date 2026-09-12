@@ -9,7 +9,8 @@ BUILD := build
 EFI := $(BUILD)/esp/EFI/BOOT/BOOTX64.EFI
 KERNEL := $(BUILD)/esp/kernel.elf
 BOOT_OBJECTS := $(BUILD)/boot/main.obj $(BUILD)/boot/load.obj
-KERNEL_OBJECTS := $(BUILD)/kernel/entry.o $(BUILD)/kernel/main.o
+KERNEL_OBJECTS := $(BUILD)/kernel/entry.o $(BUILD)/kernel/main.o $(BUILD)/kernel/serial.o \
+                  $(BUILD)/kernel/tables.o $(BUILD)/kernel/interrupts.o
 OBJECTS := $(BOOT_OBJECTS) $(KERNEL_OBJECTS)
 COMMON_CFLAGS := -std=c17 -ffreestanding -fno-builtin -fno-stack-protector \
                  -mno-red-zone -mgeneral-regs-only -Wall -Wextra -Werror -O2 -g -MMD -MP

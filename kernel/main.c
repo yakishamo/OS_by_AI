@@ -1,4 +1,6 @@
 #include "main.h"
+#include "serial.h"
+#include "tables.h"
 
 /* Published state for later kernel subsystems and debugger inspection. */
 const BOOT_INFO *kernel_boot_info;
@@ -24,5 +26,16 @@ _Noreturn void kernel_main(const BOOT_INFO *info)
         for (;;) __asm__ volatile ("pause");
     }
     kernel_boot_info = info;
+    if (!serial_init()
+        || !serial_write("KERNEL: serial ready (COM1, 115200 8N1)\n"
+                         "KERNEL: boot information verified\n")
+        || !serial_flush()) {
+        /* Failed output must not be mistaken for a successful boot. */
+        for (;;) __asm__ volatile ("pause");
+    }
+    tables_init(info->stack_base + info->stack_size);
+    if (!serial_write("KERNEL: GDT/IDT/TSS ready\nKERNEL: halting\n") || !serial_flush()) {
+        for (;;) __asm__ volatile ("pause");
+    }
     kernel_halt();
 }

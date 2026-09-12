@@ -30,7 +30,7 @@ def elf_symbols(data):
     return symbols
 
 
-def run_case(name, kernel, timeout, expected_error=None, memory_checks=()):
+def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expected_exception=None):
     executable = qemu.qemu_path()
     code, variables = qemu.firmware(executable)
     log_dir = qemu.BUILD / "tests" / name
@@ -107,11 +107,40 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=()):
                             rip = re.search(r"RIP=([0-9a-fA-F]+)", regs)
                             flags = re.search(r"RFL=([0-9a-fA-F]+)", regs)
                             symbols = elf_symbols(kernel)
+                            if expected_exception and rip and "HLT=1" in regs:
+                                if int(rip[1], 16) != symbols["exception_halt"] + 2:
+                                    raise RuntimeError(f"{name}: did not reach exception halt")
+                                vector, error, rip_delta, cr2 = expected_exception
+                                output = serial.read_bytes()
+                                required = {"vector": vector, "error": error, "cs": 8}
+                                if rip_delta is not None:
+                                    required["rip"] = symbols["kernel_halt"] + rip_delta
+                                if cr2 is not None:
+                                    required["cr2"] = cr2
+                                for field, value in required.items():
+                                    if f"{field}=0x{value:016x}\r\n".encode() not in output:
+                                        raise RuntimeError(f"{name}: invalid exception {field}; see {serial}")
+                                if not flags or int(flags[1], 16) & 0x200:
+                                    raise RuntimeError("Exception handler enabled interrupts")
+                                if vector == 8:
+                                    handler_rsp = int(re.search(r"RSP=([0-9a-fA-F]+)", regs)[1], 16)
+                                    bottom = symbols["double_fault_stack"]
+                                    if not bottom <= handler_rsp < bottom + 16384:
+                                        raise RuntimeError("Double fault did not use IST stack")
+                                print(f"PASS: {name}: exception vector/error/RIP and halt verified", flush=True)
+                                return
                             if (rip and flags and "HLT=1" in regs and int(flags[1], 16) & 0x200 == 0
                                     and int(rip[1], 16) == symbols["kernel_halt"] + 1):
                                 instruction = monitor(f"x /1i 0x{int(rip[1], 16) - 1:x}")
                                 if not re.search(r"\bhlt\b", instruction):
                                     raise RuntimeError("Stopped outside HLT")
+                                kernel_log = (
+                                    b"KERNEL: serial ready (COM1, 115200 8N1)\r\n"
+                                    b"KERNEL: boot information verified\r\n"
+                                    b"KERNEL: GDT/IDT/TSS ready\r\n"
+                                    b"KERNEL: halting\r\n")
+                                if kernel_log not in serial.read_bytes():
+                                    raise RuntimeError(f"{name}: kernel serial output missing or corrupted")
 
                                 def read_memory(address, length):
                                     result = bytearray()
@@ -131,6 +160,25 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=()):
                                 def read_u64(address):
                                     return struct.unpack("<Q", read_memory(address, 8))[0]
 
+                                for table, symbol, limit in (("GDT", "kernel_gdt", 39), ("IDT", "kernel_idt", 4095)):
+                                    descriptor = re.search(rf"{table}=\s*([0-9a-fA-F]+)\s+([0-9a-fA-F]+)", regs)
+                                    if not descriptor or (int(descriptor[1], 16), int(descriptor[2], 16)) != (symbols[symbol], limit):
+                                        raise RuntimeError(f"Incorrect {table} register")
+                                for segment, segment_selector in (("CS", 8), ("SS", 16), ("DS", 16), ("ES", 16), ("TR", 24)):
+                                    value = re.search(rf"{segment}\s*=([0-9a-fA-F]+)", regs)
+                                    if not value or int(value[1], 16) != segment_selector:
+                                        raise RuntimeError(f"Incorrect {segment} selector")
+                                gates = read_memory(symbols["kernel_idt"], 4096)
+                                for vector in range(256):
+                                    lo, gate_selector, ist, attr, mid, hi, reserved = struct.unpack_from("<HHBBHII", gates, vector * 16)
+                                    if ((lo | mid << 16 | hi << 32) != symbols[f"isr_{vector}"]
+                                            or gate_selector != 8 or ist != (1 if vector == 8 else 0)
+                                            or attr != 0x8e or reserved):
+                                        raise RuntimeError(f"Invalid IDT gate {vector}")
+                                tss = read_memory(symbols["kernel_tss"], 104)
+                                if (struct.unpack_from("<Q", tss, 36)[0] != symbols["double_fault_stack"] + 16384
+                                        or struct.unpack_from("<H", tss, 102)[0] != 104):
+                                    raise RuntimeError("Invalid TSS / IST configuration")
                                 pointer = read_u64(symbols["kernel_boot_info"])
                                 info = struct.unpack("<QIIQQQIIQQQQQ", read_memory(pointer, 88))
                                 (magic, version, info_size, mmap, mmap_size, stride, desc_version,
@@ -221,14 +269,42 @@ def test_all(timeout=60):
     phnum = struct.unpack_from("<H", original, 56)[0]
     struct.pack_into("<H", fixture, 56, phnum + 1)
     extra_ph = phoff + 56 * phnum
+    original_segments = [struct.unpack_from("<IIQQQQQQ", original, phoff + 56 * i)
+                         for i in range(phnum)]
+    data_address = max((p[3] + p[6] + 4095) & ~4095
+                       for p in original_segments if p[0] == 1 and p[6])
     data_offset = (len(fixture) + 4095) & ~4095
     payload = b"KERNEL-DATA-TEST!"
     fixture.extend(bytes(data_offset + len(payload) - len(fixture)))
     fixture[data_offset:] = payload
     struct.pack_into("<IIQQQQQQ", fixture, extra_ph,
-                     1, 6, data_offset, 0x102000, 0x102000, len(payload), 8192, 4096)
+                     1, 6, data_offset, data_address, data_address, len(payload), 8192, 4096)
     run_case("data-bss", fixture, timeout, memory_checks=[
-        (0x102000, payload), (0x102000 + len(payload), bytes(16)), (0x103ff0, bytes(16))])
+        (data_address, payload), (data_address + len(payload), bytes(16)),
+        (data_address + 8192 - 16, bytes(16))])
     overlap = bytearray(fixture)
     struct.pack_into("<QQ", overlap, extra_ph + 16, 0x100000, 0x100000)
     run_case("overlap", overlap, timeout, b"load kernel.elf status=0x8000000000000001")
+
+    symbols = elf_symbols(original)
+    def fault_image(instructions):
+        image = bytearray(original)
+        address = symbols["kernel_halt"]
+        for segment in original_segments:
+            if segment[0] == 1 and segment[3] <= address and address + len(instructions) <= segment[3] + segment[5]:
+                offset = segment[2] + address - segment[3]
+                image[offset:offset + len(instructions)] = instructions
+                return image
+        raise RuntimeError("Fault fixture does not fit kernel text")
+
+    run_case("invalid-opcode", fault_image(bytes.fromhex("0f0b")), timeout,
+             expected_exception=(6, 0, 0, None))
+    # push -1; pop rax; mov ax,ds -> invalid selector, hardware error code.
+    run_case("general-protection", fault_image(bytes.fromhex("6aff588ed8")), timeout,
+             expected_exception=(13, 0xfffc, 3, None))
+    # Read from 1 TiB, outside the inherited QEMU firmware page tables.
+    run_case("page-fault", fault_image(bytes.fromhex("6a015848c1e028488b00")), timeout,
+             expected_exception=(14, 0, 7, 1 << 40))
+    # Destroy RSP, then push: delivering the resulting fault also fails.
+    run_case("double-fault", fault_image(bytes.fromhex("31e450")), timeout,
+             expected_exception=(8, 0, None, None))

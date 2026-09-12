@@ -33,7 +33,7 @@ make doctor  # ツールとファームウェアの配置確認
 ローダーにカーネルのオブジェクトはリンクせず、カーネルはUEFIのヘッダーを使いません。
 `kernel/linker.ld`で入口を `kernel_entry`、リンクアドレスを `0x100000` に指定しています。
 ローダーはELFの指定するロード領域を確保してからセグメントを配置します。
-カーネルは起動情報とスタック位置を確認してHLTループへ進みます。
+カーネルは起動情報とスタック位置を確認し、自身のシリアルドライバーでログを出してHLTループへ進みます。
 
 macOS arm64 / LLVM 21.1.8 / QEMU 10.2.0 / Python 3.14.6 / GNU Make 3.81で開発しています。
 HomebrewのLLVMを使う場合のPATH設定例:
@@ -58,11 +58,29 @@ BOOT: EFI_SERIAL_IO_PROTOCOL via LocateProtocol
 BOOT: serial ready (115200 8N1)
 BOOT: loading kernel.elf
 BOOT: kernel entry=0x0000000000100000
+KERNEL: serial ready (COM1, 115200 8N1)
+KERNEL: boot information verified
+KERNEL: GDT/IDT/TSS ready
+KERNEL: halting
 ```
 
 終了は **Ctrl-aを押して離し、x**。Ctrl-aを押して離し、cでQEMUモニターに切り替わります。
 ログの後、カーネルがHLTで停止するため、入力に反応しないのが正常です。
-ログはすべてBoot Services終了前のローダーによる出力です。
+`BOOT:` はBoot Services終了前のローダーによる出力、`KERNEL:` は終了後のカーネルによる出力です。
+
+## カーネルのシリアル出力
+
+`kernel/serial.c` はQEMU PCのCOM1（I/Oポート `0x3f8`）を直接操作します。
+UEFIのプロトコルや割り込みには依存しません。設定は115200 baud / 8N1、FIFO有効、UART割り込み無効です。
+
+- `serial_init()`：ローダーの残りの送信を待ち、UARTを初期化。
+- `serial_write()`：送信可能になるまでポーリングし、文字列を出力。LFはCRLFへ変換。
+- `serial_flush()`：FIFOとシフトレジスターの両方が空になるまで待機。
+
+各関数は成功・失敗をboolで返します。ポーリングには回数上限を設けていますが、
+カーネルタイマーが未実装なので実時間のタイムアウトではありません。
+出力失敗時はPAUSEループに入り、正常なHLT到達として扱いません。
+現在は単一CPUの起動ログ用で、入力・送信割り込み・複数CPU間の排他制御は未実装です。
 
 ## カーネル読み込みの手順と範囲
 
@@ -79,7 +97,7 @@ BOOT: kernel entry=0x0000000000100000
 - ロード先は1 MiB以上・4 GiB未満で、仮想アドレスと物理アドレスが一致する固定配置を扱います。
 - 動的リンクや再配置は未対応です。セグメントの範囲外参照、サイズ矛盾、重複、無効な入口等は拒否します。
 - 初期メモリマップのバッファは64 KiBです。不足時は明示的に失敗します。
-- カーネルは専用スタックを使います。ページテーブル・GDT・IDT等はまだ既存のものを引き継ぎます。スタックのガードページや独自のページ保護は未実装です。
+- カーネルは専用スタックを使います。ページテーブルはまだ既存のものを引き継ぎます。GDT・IDT・TSSはカーネル専用のものに切り替えます。スタックのガードページや独自のページ保護は未実装です。
 - ExitBootServicesを一度試みた後はUEFI出力や呼び出し元への復帰をしません。終了失敗やカーネルからの想定外の復帰では、`boot_exit_failure` にステータスを保存し、ローダー内のPAUSEループで停止します。
 
 ## 起動情報とスタック
@@ -107,18 +125,43 @@ BOOT: kernel entry=0x0000000000100000
 検証失敗時はPAUSEループで待機するため、正常なHLTとは区別できます。
 メモリマップの走査では、構造体のsizeofではなく、渡された `descriptor_size` を刻み幅に使います。
 
+## GDT・IDTと例外処理
+
+`kernel/tables.c` と `kernel/interrupts.S` で、次のカーネル専用テーブルを構築・ロードします。
+
+- GDT：null、ring 0の64-bitコード（0x08）、データ（0x10）、64-bit TSS（0x18、2スロット）。
+- TSS：RSP0にカーネルスタック上端を設定し、IST1に16 KiBのダブルフォルト専用スタックを設定。
+- IDT：256個すべてをDPL0の64-bit interrupt gateとして登録。ベクター8（#DF）のみIST1を使用。
+
+GDTはLGDTの後にfar returnでCSを再ロードし、DS・ES・SSも更新します。LTRでTSSを、LIDTでIDTをロードします。
+割り込み許可フラグは無効のままです。PIC/APIC、タイマー、外部IRQの処理はまだ実装していません。
+
+例外入口は、CPUがエラーコードを積まないベクターには0を補い、番号とエラーコードを共通形式にします。
+Cのハンドラーは番号、エラーコード、RIP、CS、RFLAGS、例外前のRSPをシリアルへ出力し、
+ページフォルトではCR2も出力して停止します。
+現在はすべて致命的な例外として扱い、IRETによる復帰や汎用レジスターの保存・復元は行いません。
+
+ダブルフォルト用スタックはカーネルBSSにあり、通常のスタックが壊れた場合にも例外を報告できるようにしています。
+NMI専用スタック、再入可能なログ出力、スタックのガードページは今後の段階です。
+
+例外テストはビルド済みELFのコピーの停止箇所をテスト用命令で置き換えます。
+通常のカーネルには例外を発生させるコードを追加しません。
+ダブルフォルトテストはRSPを壊して例外配信自体を失敗させ、専用ISTへの切り替えを実際に確認します。
+
 ## 自動テスト
 
-`make test` は生成物の検証に加え、次の7ケースをQEMUで逐次実行します。
+`make test` は生成物の検証に加え、次の11ケースをQEMUで逐次実行します。
 
-- 本物の `kernel.elf` を起動し、`kernel_halt`でのRIP、`HLT=1`、`IF=0`、RIP直前のHLT命令を確認。
+- 本物の `kernel.elf` を起動し、`kernel_halt`でのRIP、`HLT=1`、`IF=0`、RIP直前のHLT命令、およびカーネルのシリアルログ4行をCRLFも含めて確認。
 - カーネルファイルの欠落、ELF識別子の破損、ファイル範囲外のセグメント、無効な入口を拒否。
 - PT_LOADを追加したテスト用ELFで、データのコピーとBSS先頭・末尾のゼロ初期化を確認。
 - 重複するロードセグメントを拒否。
+- 不正命令、一般保護例外、ページフォルト、ダブルフォルトを発生させ、例外番号・エラーコード・停止位置を確認。ページフォルトではCR2、ダブルフォルトではISTスタックの使用も確認。
 
 テスト用の変更は一時ディスクだけに適用し、ビルド済みカーネルは変更しません。
 正常起動ケースでは、受け取った起動情報、専用スタックの上端・C処理開始時・停止時のRSP、
 最終メモリマップ上のカーネルと起動情報領域のメモリ種別・範囲も確認します。
+GDTR・IDTR・セグメントセレクター・TR、およびIDT全256エントリとTSSのIST設定も読み取ります。
 ログは `build/tests/<ケース名>/` 以下の `serial.log`、`cpu.log`、`qemu.log`、`boot-info.json` に保存します。
 QMPはパイプ経由で接続し、ネットワークポートは使いません。
 各ケースの制限時間は60秒です。全体を同時実行せず、逐次実行してください。
@@ -174,6 +217,11 @@ boot/efi.h              UEFI ABIの宣言
 include/boot_info.h      ローダーとカーネルの共通起動情報ABI
 kernel/entry.S          専用スタックへの切り替えとC入口への移行
 kernel/main.c           起動情報の確認と最小カーネル
+kernel/serial.c         カーネル用COM1ポーリング出力
+kernel/serial.h         シリアル出力のインターフェース
+kernel/tables.c         GDT・IDT・TSS構築と例外診断
+kernel/tables.h         テーブル初期化と例外フレームの定義
+kernel/interrupts.S     テーブル切り替えと各例外の入口
 kernel/main.h           カーネル入口の宣言
 kernel/linker.ld        ELF64の配置と入口
 scripts/check_build.py  生成物の検証
@@ -182,10 +230,12 @@ scripts/qemu.py         QEMU起動・ファームウェア検出
 Makefile               独立したコンパイル・リンク規則
 ```
 
-次の段階では、カーネル自身のログ出力と例外処理を小さく追加していきます。
+次の段階では、メモリマップを使った物理ページ管理などを小さく追加していきます。
 
 ## 参照資料
 
 - [UEFI Loaded Image](https://uefi.org/specs/UEFI/2.10/09_Protocols_EFI_Loaded_Image.html): 起動元デバイスの取得。
 - [UEFI Media Access](https://uefi.org/specs/UEFI/2.10/13_Protocols_Media_Access.html): ファイル操作。
 - [UEFI Boot Services](https://uefi.org/specs/UEFI/2.10_A/07_Services_Boot_Services.html): メモリ確保・Boot Services終了。
+
+- [Intel SDM](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html): 64-bit GDT、IDT、TSS、ISTと例外フレーム。
