@@ -14,6 +14,7 @@ typedef void *EFI_HANDLE;
 #define EFI_ERROR_BIT ((EFI_STATUS)1 << 63)
 #define EFI_ERROR(status) (((status) & EFI_ERROR_BIT) != 0)
 #define EFI_DEVICE_ERROR (EFI_ERROR_BIT | 7)
+#define EFI_INVALID_PARAMETER (EFI_ERROR_BIT | 2)
 #define EFI_TIMEOUT (EFI_ERROR_BIT | 18)
 
 typedef struct {
@@ -31,14 +32,20 @@ typedef void (EFIAPI *EFI_UNUSED_SERVICE)(void);
 typedef struct {
     EFI_TABLE_HEADER Hdr;
     EFI_UNUSED_SERVICE RaiseTPL, RestoreTPL;
-    EFI_UNUSED_SERVICE AllocatePages, FreePages, GetMemoryMap, AllocatePool, FreePool;
+    EFI_UNUSED_SERVICE AllocatePages, FreePages;
+    EFI_STATUS (EFIAPI *GetMemoryMap)(uintptr_t *MemoryMapSize, void *MemoryMap,
+                                      uintptr_t *MapKey, uintptr_t *DescriptorSize,
+                                      uint32_t *DescriptorVersion);
+    EFI_UNUSED_SERVICE AllocatePool, FreePool;
     EFI_UNUSED_SERVICE CreateEvent, SetTimer, WaitForEvent, SignalEvent, CloseEvent, CheckEvent;
     EFI_UNUSED_SERVICE InstallProtocolInterface, ReinstallProtocolInterface;
     EFI_UNUSED_SERVICE UninstallProtocolInterface, HandleProtocol;
     void *Reserved;
     EFI_UNUSED_SERVICE RegisterProtocolNotify, LocateHandle, LocateDevicePath;
     EFI_UNUSED_SERVICE InstallConfigurationTable, LoadImage, StartImage, Exit;
-    EFI_UNUSED_SERVICE UnloadImage, ExitBootServices, GetNextMonotonicCount;
+    EFI_UNUSED_SERVICE UnloadImage;
+    EFI_STATUS (EFIAPI *ExitBootServices)(EFI_HANDLE ImageHandle, uintptr_t MapKey);
+    EFI_UNUSED_SERVICE GetNextMonotonicCount;
     EFI_STATUS (EFIAPI *Stall)(uintptr_t Microseconds);
     EFI_STATUS (EFIAPI *SetWatchdogTimer)(uintptr_t Timeout, uint64_t WatchdogCode,
                                          uintptr_t DataSize, uint16_t *WatchdogData);
@@ -96,6 +103,8 @@ _Static_assert(sizeof(EFI_TABLE_HEADER) == 24, "UEFI table header layout");
 _Static_assert(offsetof(EFI_SYSTEM_TABLE, ConOut) == 64, "UEFI ConOut offset");
 _Static_assert(offsetof(EFI_SYSTEM_TABLE, BootServices) == 96, "UEFI BootServices offset");
 _Static_assert(offsetof(EFI_BOOT_SERVICES, SetWatchdogTimer) == 256, "UEFI watchdog offset");
+_Static_assert(offsetof(EFI_BOOT_SERVICES, GetMemoryMap) == 56, "UEFI memory map offset");
+_Static_assert(offsetof(EFI_BOOT_SERVICES, ExitBootServices) == 232, "UEFI exit offset");
 _Static_assert(offsetof(EFI_BOOT_SERVICES, LocateProtocol) == 320, "UEFI LocateProtocol offset");
 _Static_assert(offsetof(EFI_SERIAL_IO_PROTOCOL, Write) == 40, "UEFI Serial Write offset");
 _Static_assert(offsetof(EFI_SERIAL_IO_PROTOCOL, Read) == 48, "UEFI Serial Read offset");

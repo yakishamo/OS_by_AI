@@ -1,4 +1,7 @@
 #include "efi.h"
+#include "../kernel/main.h"
+
+volatile EFI_STATUS boot_exit_failure;
 
 /* Serial may be unavailable: report failures through the UEFI text console. */
 static EFI_STATUS report_error(EFI_SYSTEM_TABLE *table, const char *operation, EFI_STATUS status)
@@ -23,9 +26,8 @@ static EFI_STATUS report_error(EFI_SYSTEM_TABLE *table, const char *operation, E
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_table)
 {
-    (void)image_handle;
     EFI_BOOT_SERVICES *services = system_table->BootServices;
-    /* This interactive probe may stay open longer than the boot watchdog. */
+    /* Disable the firmware watchdog before handing control to the kernel. */
     EFI_STATUS status = services->SetWatchdogTimer(0, 0, 0, NULL);
     if (EFI_ERROR(status)) {
         return report_error(system_table, "SetWatchdogTimer", status);
@@ -52,9 +54,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
         "\r\nBOOT: UEFI x86_64 C entry\r\n"
         "BOOT: EFI_SERIAL_IO_PROTOCOL via LocateProtocol\r\n"
         "BOOT: serial ready (115200 8N1)\r\n"
-        "BOOT: environment probe; kernel not loaded\r\n"
-        "Type to echo via UEFI Serial IO; Ctrl-a x exits QEMU.\r\n"
-        "SERIAL> ";
+        "BOOT: preparing ExitBootServices; kernel will halt\r\n";
     uintptr_t size = sizeof(banner) - 1;
     status = serial->Write(serial, &size, banner);
     if (!EFI_ERROR(status) && size != sizeof(banner) - 1) {
@@ -64,33 +64,54 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
         return report_error(system_table, "Serial IO Write", status);
     }
 
+    /* Print the relocated entry address before obtaining the final map key. */
+    char entry[] = "BOOT: kernel entry=0x0000000000000000\r\n";
+    uintptr_t address = (uintptr_t)kernel_main;
+    const char digits[] = "0123456789abcdef";
+    for (unsigned i = 0; i < 16; ++i) {
+        entry[sizeof("BOOT: kernel entry=0x") - 1 + i] = digits[(address >> ((15 - i) * 4)) & 15];
+    }
+    size = sizeof(entry) - 1;
+    status = serial->Write(serial, &size, entry);
+    if (EFI_ERROR(status) || size != sizeof(entry) - 1) {
+        return report_error(system_table, "Serial IO Write",
+                            EFI_ERROR(status) ? status : EFI_DEVICE_ERROR);
+    }
+
+    /* Fixed capacity for the initial QEMU target; no allocation changes the map.
+     * This storage and the inherited stack remain in the loaded image/loader data.
+     */
+    static uint64_t memory_map[8192];
+    uintptr_t map_key, descriptor_size;
+    uint32_t descriptor_version;
+    for (unsigned attempt = 0; attempt < 8; ++attempt) {
+        size = sizeof(memory_map);
+        status = services->GetMemoryMap(&size, memory_map, &map_key,
+                                        &descriptor_size, &descriptor_version);
+        if (EFI_ERROR(status)) {
+            if (attempt == 0) {
+                return report_error(system_table, "GetMemoryMap", status);
+            }
+            break;
+        }
+        /* No logging or other service calls between the map and the exit. */
+        status = services->ExitBootServices(image_handle, map_key);
+        if (status == EFI_SUCCESS) {
+            kernel_main();
+        }
+        if (status != EFI_INVALID_PARAMETER) {
+            break;
+        }
+        /* The map changed: get a fresh key and retry, without using protocols. */
+    }
+
+    /* An attempted exit may have partly shut firmware down. Do not return or
+     * print through UEFI. Keep the error visible to a debugger and stop here.
+     * Use PAUSE, not HLT, so this path cannot satisfy the kernel halt test.
+     */
+    boot_exit_failure = status;
+    __asm__ volatile ("cli" : : : "memory");
     for (;;) {
-        char character;
-        size = 1;
-        status = serial->Read(serial, &size, &character);
-        if (status == EFI_TIMEOUT) {
-            continue; /* No input within the timeout is normal. */
-        }
-        if (EFI_ERROR(status)) {
-            return report_error(system_table, "Serial IO Read", status);
-        }
-        if (size != 1) {
-            return report_error(system_table, "Serial IO Read size", EFI_DEVICE_ERROR);
-        }
-        static char prompt[] = "\r\nSERIAL> ";
-        void *buffer = &character;
-        uintptr_t requested = 1;
-        if (character == '\r' || character == '\n') {
-            buffer = prompt;
-            requested = sizeof(prompt) - 1;
-        }
-        size = requested;
-        status = serial->Write(serial, &size, buffer);
-        if (!EFI_ERROR(status) && size != requested) {
-            status = EFI_DEVICE_ERROR;
-        }
-        if (EFI_ERROR(status)) {
-            return report_error(system_table, "Serial IO Write", status);
-        }
+        __asm__ volatile ("pause");
     }
 }

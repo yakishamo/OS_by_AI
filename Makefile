@@ -7,7 +7,7 @@ PYTHON ?= python3
 
 BUILD := build
 EFI := $(BUILD)/esp/EFI/BOOT/BOOTX64.EFI
-OBJECTS := $(BUILD)/boot/main.obj
+OBJECTS := $(BUILD)/boot/main.obj $(BUILD)/kernel/main.obj
 CFLAGS := --no-default-config --target=x86_64-pc-windows-msvc -std=c17 \
           -ffreestanding -fno-builtin -fno-stack-protector \
           -mno-stack-arg-probe -mno-red-zone -mgeneral-regs-only \
@@ -17,7 +17,7 @@ CFLAGS := --no-default-config --target=x86_64-pc-windows-msvc -std=c17 \
 all: build
 build: $(EFI)
 
-$(BUILD)/boot/%.obj: boot/%.c Makefile
+$(BUILD)/%.obj: %.c Makefile
 	@mkdir -p $(@D)
 	$(CLANG) $(CFLAGS) -c $< -o $@
 
@@ -44,9 +44,9 @@ clean:
 	rm -rf $(BUILD)
 
 help:
-	@echo 'make build   Build the x86_64 UEFI serial probe (C)'
-	@echo 'make run     Boot the UEFI Serial IO probe; quit with Ctrl-a x'
-	@echo 'make test    Check UEFI Serial IO input/output (60s timeout)'
+	@echo 'make build   Build the UEFI loader and minimal C kernel'
+	@echo 'make run     Boot the kernel; quit with Ctrl-a x'
+	@echo 'make test    Verify kernel HLT and interrupts disabled (60s timeout)'
 	@echo 'make debug   GDB stdio transport; see README before using'
 	@echo 'make doctor  Check tools and firmware paths'
 	@echo 'make clean   Remove generated files'

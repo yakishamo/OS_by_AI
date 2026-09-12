@@ -10,7 +10,8 @@ import subprocess
 import sys
 import tempfile
 import time
-import uuid
+import json
+import re
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / "build"
@@ -86,7 +87,8 @@ def command(qemu, code, variables, esp, mode):
             "-S", "-gdb", "stdio",
         ]
     elif mode == "test":
-        result += ["-monitor", "none", "-serial", "stdio"]
+        result += ["-monitor", "none", "-qmp", "stdio",
+                   "-serial", f"file:{BUILD / 'serial-test.log'}"]
     else:
         result += ["-serial", "mon:stdio"]
     return result
@@ -104,45 +106,78 @@ def stop(process):
 
 def smoke_test(arguments, timeout):
     log_path = BUILD / "serial-test.log"
-    nonce = ("serial-" + uuid.uuid4().hex).encode("ascii")
-    transcript = bytearray()
-    stage = 0
-    passed = False
+    registers_path = BUILD / "kernel-test.log"
+    log_path.write_bytes(b"")
+    registers_path.write_text("")
     deadline = time.monotonic() + timeout
-    with log_path.open("wb") as log, subprocess.Popen(
-        arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+    with (BUILD / "qemu-test.log").open("wb") as errors, subprocess.Popen(
+        arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors
     ) as process:
         try:
             with selectors.DefaultSelector() as selector:
                 selector.register(process.stdout, selectors.EVENT_READ)
+                pending = bytearray()
+
+                def receive():
+                    while time.monotonic() < deadline:
+                        if b"\n" in pending:
+                            line, _, rest = pending.partition(b"\n")
+                            pending[:] = rest
+                            return json.loads(line)
+                        if selector.select(timeout=min(0.1, max(0, deadline - time.monotonic()))):
+                            data = os.read(process.stdout.fileno(), 4096)
+                            if not data:
+                                raise RuntimeError("QEMU exited before the kernel halt test completed.")
+                            pending.extend(data)
+                    raise RuntimeError(f"Kernel halt test timed out after {timeout:g}s.")
+
+                def request(name, arguments=None):
+                    payload = {"execute": name}
+                    if arguments is not None:
+                        payload["arguments"] = arguments
+                    process.stdin.write(json.dumps(payload).encode() + b"\n")
+                    process.stdin.flush()
+                    while True:
+                        message = receive()
+                        if "error" in message:
+                            raise RuntimeError(f"QMP error: {message['error']}")
+                        if "return" in message:
+                            return message["return"]
+
+                if "QMP" not in receive():
+                    raise RuntimeError("QMP greeting missing.")
+                request("qmp_capabilities")
                 while time.monotonic() < deadline:
-                    events = selector.select(timeout=min(0.2, max(0, deadline - time.monotonic())))
-                    for key, _ in events:
-                        data = os.read(key.fileobj.fileno(), 4096)
-                        if not data:
-                            raise RuntimeError("QEMU exited before the serial test completed.")
-                        log.write(data)
-                        log.flush()
-                        transcript.extend(data)
-                    outgoing = None
+                    if process.poll() is not None:
+                        raise RuntimeError("QEMU exited before kernel halt verification.")
+                    transcript = log_path.read_bytes()
                     if b"BOOT ERROR:" in transcript:
-                        raise RuntimeError("UEFI application reported an error; see serial log.")
-                    if stage == 0 and b"BOOT: EFI_SERIAL_IO_PROTOCOL via LocateProtocol\r\n" in transcript and b"SERIAL> " in transcript:
-                        outgoing = nonce + b"\r"
-                    elif stage == 1 and nonce + b"\r\nSERIAL> " in transcript:
-                        passed = True
-                        break
-                    if outgoing is not None:
-                        process.stdin.write(outgoing)
-                        process.stdin.flush()
-                        transcript.clear()
-                        stage += 1
-                if not passed:
-                    raise RuntimeError(f"UEFI Serial IO test timed out after {timeout:g}s (stage {stage}/1).")
+                        raise RuntimeError("UEFI loader reported an error; see serial-test.log.")
+                    entry = re.search(rb"BOOT: kernel entry=0x([0-9a-f]{16})\r\n", transcript)
+                    if entry:
+                        registers = request("human-monitor-command", {"command-line": "info registers"})
+                        registers_path.write_text(registers)
+                        rip = re.search(r"RIP=([0-9a-fA-F]+)", registers)
+                        flags = re.search(r"RFL=([0-9a-fA-F]+)", registers)
+                        address = int(entry[1], 16)
+                        # The minimal kernel is CLI, alignment padding, HLT, JMP.
+                        if (rip and flags and "HLT=1" in registers
+                                and address <= int(rip[1], 16) < address + 32
+                                and int(flags[1], 16) & 0x200 == 0):
+                            instruction = request("human-monitor-command", {
+                                "command-line": f"x /1i 0x{int(rip[1], 16) - 1:x}"})
+                            with registers_path.open("a") as log:
+                                log.write("\n" + instruction)
+                            if re.search(r"\bhlt\b", instruction):
+                                print("PASS: kernel HLT reached after ExitBootServices; IF=0, HLT=1")
+                                return
+                    # No sockets required: QMP uses pipes and serial goes to a file.
+                    time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+                raise RuntimeError(f"Kernel halt test timed out after {timeout:g}s; see kernel-test.log.")
         finally:
             stop(process)
             print(f"Serial log: {log_path}")
-    print("PASS: UEFI Serial IO protocol discovery and serial input/output")
+            print(f"CPU state: {registers_path}")
 
 
 def main():
