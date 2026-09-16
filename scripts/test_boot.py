@@ -93,7 +93,7 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
                         if process.poll() is not None:
                             raise RuntimeError(f"{name}: QEMU exited")
                         transcript = serial.read_bytes()
-                        if b"BOOT ERROR:" in transcript:
+                        if re.search(rb"BOOT ERROR:[^\r\n]*\r\n", transcript):
                             if expected_error and expected_error in transcript and b"BOOT: kernel entry=" not in transcript:
                                 print(f"PASS: {name} rejected by loader", flush=True)
                                 return
@@ -138,6 +138,8 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
                                     b"KERNEL: serial ready (COM1, 115200 8N1)\r\n"
                                     b"KERNEL: boot information verified\r\n"
                                     b"KERNEL: GDT/IDT/TSS ready\r\n"
+                                    b"KERNEL: physical pages ready (4 KiB, self-test passed)\r\n"
+                                    b"KERNEL: paging ready (own CR3, RAM check passed)\r\n"
                                     b"KERNEL: halting\r\n")
                                 if kernel_log not in serial.read_bytes():
                                     raise RuntimeError(f"{name}: kernel serial output missing or corrupted")
@@ -223,6 +225,50 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
                                         or not covered(pointer, 33 * 4096, 2)
                                         or not (pointer + 33 * 4096 <= low or pointer >= high)):
                                     raise RuntimeError("Kernel / handoff ownership missing from final memory map")
+                                root = read_u64(symbols["paging_root"])
+                                old_cr3 = read_u64(symbols["paging_previous_cr3"])
+                                cr3 = int(re.search(r"CR3=([0-9a-fA-F]+)", regs)[1], 16)
+                                if cr3 != root or root == (old_cr3 & ~4095) or root % 4096:
+                                    raise RuntimeError("Kernel CR3 was not replaced")
+                                tables, mapped = set(), set()
+
+                                def walk(table, shift, prefix):
+                                    if table in tables or not covered(table, 4096, 7):
+                                        raise RuntimeError("Page table reused or outside conventional RAM")
+                                    tables.add(table)
+                                    entries = struct.unpack("<512Q", read_memory(table, 4096))
+                                    for index, value in enumerate(entries):
+                                        if not value:
+                                            continue
+                                        # Permit CPU-updated accessed/dirty bits only.
+                                        if (value & ~0x000ffffffffff000 & ~0x60) != 3:
+                                            raise RuntimeError("Invalid paging flags or unexpected huge page")
+                                        physical = value & 0x000ffffffffff000
+                                        virtual = prefix | (index << shift)
+                                        if shift == 12:
+                                            if virtual != physical:
+                                                raise RuntimeError("Non-identity mapping")
+                                            mapped.add(virtual)
+                                        else:
+                                            walk(physical, shift - 9, virtual)
+
+                                walk(root, 39, 0)
+                                expected_pages = set()
+                                for offset in range(0, mmap_size, stride):
+                                    kind, _, physical, _, pages, attr = struct.unpack_from("<IIQQQQ", descriptors, offset)
+                                    if kind in (1, 2, 7) and attr & 8 and not attr & (1 << 63):
+                                        expected_pages.update(range(max(physical, 0x100000),
+                                                                    min(physical + pages * 4096, 1 << 32), 4096))
+                                if mapped != expected_pages or not tables <= mapped:
+                                    raise RuntimeError("RAM coverage or reserved-region exclusion mismatch")
+                                if len(tables) != read_u64(symbols["paging_table_count"]):
+                                    raise RuntimeError("Page table accounting mismatch")
+                                if read_u64(symbols["total_pages"]) - read_u64(symbols["free_pages"]) != len(tables):
+                                    raise RuntimeError("PMM allocation count does not match page tables")
+                                for table in tables:
+                                    page = table // 4096
+                                    if not read_u64(symbols["allocated"] + (page // 64) * 8) & (1 << (page % 64)):
+                                        raise RuntimeError("Active page table is not owned by PMM")
                                 (log_dir / "boot-info.json").write_text(json.dumps({
                                     "address": pointer, "memory_map": mmap, "memory_map_size": mmap_size,
                                     "descriptor_size": stride, "descriptor_count": mmap_size // stride,
@@ -230,6 +276,8 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
                                     "stack_base": stack_base, "stack_size": stack_size,
                                     "initial_rsp": initial_rsp, "observed_rsp": observed_rsp,
                                     "current_rsp": current_rsp, "boot_services_exited": True,
+                                    "cr3": cr3, "previous_cr3": old_cr3,
+                                    "page_tables": len(tables), "mapped_pages": len(mapped),
                                 }, indent=2) + "\n")
                                 for address, expected in memory_checks:
                                     dump = monitor(f"xp /{len(expected)}bx 0x{address:x}")
@@ -299,12 +347,14 @@ def test_all(timeout=60):
 
     run_case("invalid-opcode", fault_image(bytes.fromhex("0f0b")), timeout,
              expected_exception=(6, 0, 0, None))
-    # push -1; pop rax; mov ax,ds -> invalid selector, hardware error code.
-    run_case("general-protection", fault_image(bytes.fromhex("6aff588ed8")), timeout,
-             expected_exception=(13, 0xfffc, 3, None))
-    # Read from 1 TiB, outside the inherited QEMU firmware page tables.
+    # Select just beyond our GDT; avoid depending on the inherited LDT mapping.
+    run_case("general-protection", fault_image(bytes.fromhex("6a28588ed8")), timeout,
+             expected_exception=(13, 0x28, 3, None))
+    # Read from 1 TiB, outside the kernel's own page tables.
     run_case("page-fault", fault_image(bytes.fromhex("6a015848c1e028488b00")), timeout,
              expected_exception=(14, 0, 7, 1 << 40))
+    run_case("null-page", fault_image(bytes.fromhex("31c0488b00")), timeout,
+             expected_exception=(14, 0, 2, 0))
     # Destroy RSP, then push: delivering the resulting fault also fails.
     run_case("double-fault", fault_image(bytes.fromhex("31e450")), timeout,
              expected_exception=(8, 0, None, None))

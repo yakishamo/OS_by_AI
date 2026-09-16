@@ -1,6 +1,10 @@
 #include "main.h"
 #include "serial.h"
 #include "tables.h"
+#include "pmm.h"
+#include "paging.h"
+
+extern bool pmm_boot_check(void);
 
 /* Published state for later kernel subsystems and debugger inspection. */
 const BOOT_INFO *kernel_boot_info;
@@ -34,7 +38,23 @@ _Noreturn void kernel_main(const BOOT_INFO *info)
         for (;;) __asm__ volatile ("pause");
     }
     tables_init(info->stack_base + info->stack_size);
-    if (!serial_write("KERNEL: GDT/IDT/TSS ready\nKERNEL: halting\n") || !serial_flush()) {
+    if (!serial_write("KERNEL: GDT/IDT/TSS ready\n") || !serial_flush()) {
+        for (;;) __asm__ volatile ("pause");
+    }
+    if (!pmm_init(info) || !pmm_boot_check()) {
+        serial_write("KERNEL ERROR: physical page management\n");
+        serial_flush();
+        for (;;) __asm__ volatile ("pause");
+    }
+    if (!serial_write("KERNEL: physical pages ready (4 KiB, self-test passed)\n") || !serial_flush()) {
+        for (;;) __asm__ volatile ("pause");
+    }
+    if (!paging_init(info) || !pmm_boot_check()) {
+        serial_write("KERNEL ERROR: paging initialization or RAM check\n");
+        serial_flush();
+        for (;;) __asm__ volatile ("pause");
+    }
+    if (!serial_write("KERNEL: paging ready (own CR3, RAM check passed)\nKERNEL: halting\n") || !serial_flush()) {
         for (;;) __asm__ volatile ("pause");
     }
     kernel_halt();

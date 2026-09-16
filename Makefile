@@ -4,13 +4,19 @@ SHELL := /bin/sh
 CLANG ?= clang
 LLD ?= lld
 PYTHON ?= python3
+HOST_PMM_LDFLAGS :=
+ifeq ($(shell uname -s),Darwin)
+HOST_SDK ?= /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+HOST_PMM_LDFLAGS := -Wl,-syslibroot,$(HOST_SDK) -lSystem
+endif
 
 BUILD := build
 EFI := $(BUILD)/esp/EFI/BOOT/BOOTX64.EFI
 KERNEL := $(BUILD)/esp/kernel.elf
 BOOT_OBJECTS := $(BUILD)/boot/main.obj $(BUILD)/boot/load.obj
 KERNEL_OBJECTS := $(BUILD)/kernel/entry.o $(BUILD)/kernel/main.o $(BUILD)/kernel/serial.o \
-                  $(BUILD)/kernel/tables.o $(BUILD)/kernel/interrupts.o
+                  $(BUILD)/kernel/tables.o $(BUILD)/kernel/interrupts.o \
+                  $(BUILD)/kernel/pmm.o $(BUILD)/kernel/pmm_check.o $(BUILD)/kernel/paging.o
 OBJECTS := $(BOOT_OBJECTS) $(KERNEL_OBJECTS)
 COMMON_CFLAGS := -std=c17 -ffreestanding -fno-builtin -fno-stack-protector \
                  -mno-red-zone -mgeneral-regs-only -Wall -Wextra -Werror -O2 -g -MMD -MP
@@ -51,8 +57,15 @@ $(EFI): $(BOOT_OBJECTS) Makefile
 run: build
 	$(PYTHON) scripts/qemu.py run
 
-test: build
+$(BUILD)/pmm-test.so: kernel/pmm.c kernel/pmm.h include/boot_info.h Makefile
+	@mkdir -p $(@D)
+	$(CLANG) --no-default-config -std=c17 -ffreestanding -fno-builtin \
+		-fno-stack-protector -Wall -Wextra -Werror -O2 -shared -nostdlib \
+		-fuse-ld=lld kernel/pmm.c $(HOST_PMM_LDFLAGS) -o $@
+
+test: build $(BUILD)/pmm-test.so
 	$(PYTHON) scripts/check_build.py
+	$(PYTHON) scripts/test_pmm.py
 	$(PYTHON) scripts/qemu.py test
 
 debug: build
