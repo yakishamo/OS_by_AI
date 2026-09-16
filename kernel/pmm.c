@@ -110,3 +110,8 @@ bool pmm_free(uint64_t address)
 
 uint64_t pmm_total(void) { return total_pages; }
 uint64_t pmm_available(void) { return free_pages; }
+bool pmm_is_allocated(uint64_t address)
+{
+    return ready && address < PMM_LIMIT && address % 4096 == 0
+        && bit(eligible, address / 4096) && bit(allocated, address / 4096);
+}

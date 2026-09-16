@@ -12,6 +12,7 @@
 bool pmm_init(const BOOT_INFO *info);
 bool pmm_alloc(uint64_t *address);
 bool pmm_free(uint64_t address);
+bool pmm_is_allocated(uint64_t address);
 uint64_t pmm_total(void);
 uint64_t pmm_available(void);
 #endif

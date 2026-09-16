@@ -140,6 +140,7 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
                                     b"KERNEL: GDT/IDT/TSS ready\r\n"
                                     b"KERNEL: physical pages ready (4 KiB, self-test passed)\r\n"
                                     b"KERNEL: paging ready (own CR3, RAM check passed)\r\n"
+                                    b"KERNEL: dynamic paging checks passed\r\n"
                                     b"KERNEL: halting\r\n")
                                 if kernel_log not in serial.read_bytes():
                                     raise RuntimeError(f"{name}: kernel serial output missing or corrupted")
@@ -358,3 +359,9 @@ def test_all(timeout=60):
     # Destroy RSP, then push: delivering the resulting fault also fails.
     run_case("double-fault", fault_image(bytes.fromhex("31e450")), timeout,
              expected_exception=(8, 0, None, None))
+    for name, symbol, error in (("readonly", "paging_test_readonly", 3),
+                                ("nx", "paging_test_nx", 17),
+                                ("unmapped", "paging_test_unmapped", 0)):
+        jump = b"\xe9" + struct.pack("<i", symbols[symbol] - symbols["kernel_halt"] - 5)
+        run_case(name, fault_image(jump), timeout,
+                 expected_exception=(14, error, None, 0xffff800000000000))

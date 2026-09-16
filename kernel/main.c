@@ -5,6 +5,7 @@
 #include "paging.h"
 
 extern bool pmm_boot_check(void);
+extern bool paging_boot_check(void);
 
 /* Published state for later kernel subsystems and debugger inspection. */
 const BOOT_INFO *kernel_boot_info;
@@ -54,7 +55,15 @@ _Noreturn void kernel_main(const BOOT_INFO *info)
         serial_flush();
         for (;;) __asm__ volatile ("pause");
     }
-    if (!serial_write("KERNEL: paging ready (own CR3, RAM check passed)\nKERNEL: halting\n") || !serial_flush()) {
+    if (!serial_write("KERNEL: paging ready (own CR3, RAM check passed)\n") || !serial_flush()) {
+        for (;;) __asm__ volatile ("pause");
+    }
+    if (!paging_boot_check()) {
+        serial_write("KERNEL ERROR: dynamic paging check\n");
+        serial_flush();
+        for (;;) __asm__ volatile ("pause");
+    }
+    if (!serial_write("KERNEL: dynamic paging checks passed\nKERNEL: halting\n") || !serial_flush()) {
         for (;;) __asm__ volatile ("pause");
     }
     kernel_halt();
