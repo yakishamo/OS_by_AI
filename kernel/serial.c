@@ -52,3 +52,16 @@ bool serial_flush(void)
 {
     return wait_status(0x40); /* Both FIFO and shift register are empty. */
 }
+
+int serial_read(uint8_t *byte)
+{
+    uint8_t status = x86_inb(COM1 + 5);
+    if (status == 0xff) return -1;
+    if (status & 0x1e) { /* Overrun, parity, framing or break. Discard bad byte. */
+        if (status & 1) (void)x86_inb(COM1);
+        return -1;
+    }
+    if (!(status & 1)) return 0;
+    *byte = x86_inb(COM1);
+    return 1;
+}

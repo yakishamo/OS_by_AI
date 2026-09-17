@@ -48,10 +48,15 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
             (esp / "kernel.elf").write_bytes(kernel)
         shutil.copyfile(variables, directory / "vars.fd")
         command = qemu.command(executable, code, directory / "vars.fd", esp, "test")
-        command += ["-serial", f"file:{serial}"]
+        serial_pipe = directory / "uart"
+        os.mkfifo(str(serial_pipe) + ".in")
+        os.mkfifo(str(serial_pipe) + ".out")
+        command += ["-chardev", f"pipe,id=uart,path={serial_pipe},logfile={serial}",
+                    "-serial", "chardev:uart"]
         with (log_dir / "qemu.log").open("wb") as errors, subprocess.Popen(
             command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors
         ) as process:
+            connection = None
             try:
                 with selectors.DefaultSelector() as selector:
                     selector.register(process.stdout, selectors.EVENT_READ)
@@ -89,10 +94,52 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
                     if "QMP" not in receive():
                         raise RuntimeError("Missing QMP greeting")
                     request("qmp_capabilities")
+                    console_driven = False
                     while time.monotonic() < deadline:
                         if process.poll() is not None:
                             raise RuntimeError(f"{name}: QEMU exited")
                         transcript = serial.read_bytes()
+                        if not console_driven and b"CONSOLE: ready (type 'help')\r\nK> " in transcript:
+                            connection = os.fdopen(os.open(str(serial_pipe) + ".in", os.O_RDWR | os.O_NONBLOCK), "wb", buffering=0)
+
+                            def send(data):
+                                # Respect the polled UART's small receive FIFO, including echo time.
+                                for byte in data:
+                                    connection.write(bytes([byte]))
+                                    time.sleep(0.003)
+
+                            def command_check(data, expected):
+                                start = len(serial.read_bytes())
+                                send(data)
+                                while time.monotonic() < deadline:
+                                    reply = serial.read_bytes()[start:]
+                                    if reply.endswith(b"K> "):
+                                        if expected not in reply or reply.count(b"K> ") != 1:
+                                            raise RuntimeError(f"{name}: console reply mismatch: {reply!r}")
+                                        return reply
+                                    time.sleep(0.01)
+                                raise RuntimeError(f"{name}: console command timed out")
+
+                            if name == "kernel":
+                                command_check(b"help\r\n", b"help  - list commands\r\n")
+                                command_check(b"hex\x08lp\n", b"help  - list commands\r\n")
+                                command_check(b"hex\x7flp\r", b"help  - list commands\r\n")
+                                command_check(b"\x1b[A\x1bOB help \t\r", b"help  - list commands\r\n")
+                                command_check(b"\x08\x7f\r", b"\r\nK> ")
+                                command_check(b"halt\x03", b"^C\r\nK> ")
+                                command_check(b"unknown\r", b"Unknown command.")
+                                command_check(b"help extra\r", b"Unknown command.")
+                                command_check(b" " * 127 + b"\r", b"\r\nK> ")
+                                command_check(b"help" + b" " * 124 + b"\r", b"Input discarded")
+                                reply = command_check(b"mem\r", b"pages: total=")
+                                counts = re.search(rb"pages: total=(\d+) used=(\d+) free=(\d+)", reply)
+                                if not counts or int(counts[1]) != int(counts[2]) + int(counts[3]) or int(counts[3]) == 0:
+                                    raise RuntimeError("Invalid console memory counts")
+                                command_check(b"clear\r", b"\x1b[2J\x1b[H")
+                                print("PASS: console commands, editing, CRLF, cancellation and length limits", flush=True)
+                            send(b"halt\r")
+                            console_driven = True
+                            continue
                         if re.search(rb"BOOT ERROR:[^\r\n]*\r\n", transcript):
                             if expected_error and expected_error in transcript and b"BOOT: kernel entry=" not in transcript:
                                 print(f"PASS: {name} rejected by loader", flush=True)
@@ -141,7 +188,7 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
                                     b"KERNEL: physical pages ready (4 KiB, self-test passed)\r\n"
                                     b"KERNEL: paging ready (own CR3, RAM check passed)\r\n"
                                     b"KERNEL: dynamic paging checks passed\r\n"
-                                    b"KERNEL: halting\r\n")
+                                    b"CONSOLE: ready (type 'help')\r\nK> ")
                                 if kernel_log not in serial.read_bytes():
                                     raise RuntimeError(f"{name}: kernel serial output missing or corrupted")
 
@@ -309,6 +356,8 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
                         time.sleep(0.1)
                     raise RuntimeError(f"{name}: timeout; logs in {log_dir}")
             finally:
+                if connection is not None:
+                    connection.close()
                 qemu.stop(process)
 
 

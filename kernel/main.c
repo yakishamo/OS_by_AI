@@ -4,6 +4,7 @@
 #include "tables.h"
 #include "pmm.h"
 #include "paging.h"
+#include "console.h"
 
 extern bool pmm_boot_check(void);
 extern bool paging_boot_check(void);
@@ -63,8 +64,8 @@ _Noreturn void kernel_main(const BOOT_INFO *info)
         serial_flush();
         x86_spin_forever();
     }
-    if (!serial_write("KERNEL: dynamic paging checks passed\nKERNEL: halting\n") || !serial_flush()) {
+    if (!serial_write("KERNEL: dynamic paging checks passed\n") || !serial_flush()) {
         x86_spin_forever();
     }
-    kernel_halt();
+    console_run();
 }
