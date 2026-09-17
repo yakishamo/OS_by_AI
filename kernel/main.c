@@ -1,3 +1,4 @@
+#include "../include/x86.h"
 #include "main.h"
 #include "serial.h"
 #include "tables.h"
@@ -14,8 +15,7 @@ volatile uint64_t kernel_observed_rsp;
 
 _Noreturn void kernel_main(const BOOT_INFO *info)
 {
-    uint64_t rsp;
-    __asm__ volatile ("movq %%rsp, %0" : "=r"(rsp));
+    uint64_t rsp = x86_read_rsp();
     kernel_observed_rsp = rsp;
     if (!info || info->magic != BOOT_INFO_MAGIC || info->version != BOOT_INFO_VERSION
         || info->size != sizeof(*info) || info->flags != BOOT_SERVICES_EXITED
@@ -28,7 +28,7 @@ _Noreturn void kernel_main(const BOOT_INFO *info)
         || kernel_initial_rsp != info->stack_base + info->stack_size
         || (kernel_initial_rsp & 15) != 0) {
         /* Failure remains distinguishable from a successful HLT. */
-        for (;;) __asm__ volatile ("pause");
+        x86_spin_forever();
     }
     kernel_boot_info = info;
     if (!serial_init()
@@ -36,35 +36,35 @@ _Noreturn void kernel_main(const BOOT_INFO *info)
                          "KERNEL: boot information verified\n")
         || !serial_flush()) {
         /* Failed output must not be mistaken for a successful boot. */
-        for (;;) __asm__ volatile ("pause");
+        x86_spin_forever();
     }
     tables_init(info->stack_base + info->stack_size);
     if (!serial_write("KERNEL: GDT/IDT/TSS ready\n") || !serial_flush()) {
-        for (;;) __asm__ volatile ("pause");
+        x86_spin_forever();
     }
     if (!pmm_init(info) || !pmm_boot_check()) {
         serial_write("KERNEL ERROR: physical page management\n");
         serial_flush();
-        for (;;) __asm__ volatile ("pause");
+        x86_spin_forever();
     }
     if (!serial_write("KERNEL: physical pages ready (4 KiB, self-test passed)\n") || !serial_flush()) {
-        for (;;) __asm__ volatile ("pause");
+        x86_spin_forever();
     }
     if (!paging_init(info) || !pmm_boot_check()) {
         serial_write("KERNEL ERROR: paging initialization or RAM check\n");
         serial_flush();
-        for (;;) __asm__ volatile ("pause");
+        x86_spin_forever();
     }
     if (!serial_write("KERNEL: paging ready (own CR3, RAM check passed)\n") || !serial_flush()) {
-        for (;;) __asm__ volatile ("pause");
+        x86_spin_forever();
     }
     if (!paging_boot_check()) {
         serial_write("KERNEL ERROR: dynamic paging check\n");
         serial_flush();
-        for (;;) __asm__ volatile ("pause");
+        x86_spin_forever();
     }
     if (!serial_write("KERNEL: dynamic paging checks passed\nKERNEL: halting\n") || !serial_flush()) {
-        for (;;) __asm__ volatile ("pause");
+        x86_spin_forever();
     }
     kernel_halt();
 }

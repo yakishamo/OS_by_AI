@@ -1,3 +1,4 @@
+#include "../include/x86.h"
 #include "load.h"
 #include "../include/boot_info.h"
 
@@ -123,7 +124,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
         if (status == EFI_SUCCESS) {
             info->flags = BOOT_SERVICES_EXITED;
             typedef void (__attribute__((sysv_abi)) *KERNEL_ENTRY)(const BOOT_INFO *, uint64_t);
-            __asm__ volatile ("cli" : : : "memory");
+            x86_disable_interrupts();
             ((KERNEL_ENTRY)(uintptr_t)kernel.entry)(info, info->stack_base + info->stack_size);
             /* A kernel must never return to retired boot services. */
             status = EFI_LOAD_ERROR;
@@ -133,6 +134,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
     }
     /* After an attempted exit firmware may be partially shut down. */
     boot_exit_failure = status;
-    __asm__ volatile ("cli" : : : "memory");
-    for (;;) __asm__ volatile ("pause");
+    x86_disable_interrupts();
+    x86_spin_forever();
 }

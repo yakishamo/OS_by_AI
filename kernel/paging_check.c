@@ -1,8 +1,9 @@
+#include "../include/x86.h"
 #include "paging.h"
 
 static void check_failed(void)
 {
-    for (;;) __asm__ volatile ("pause");
+    x86_spin_forever();
 }
 
 bool paging_boot_check(void)
