@@ -121,6 +121,16 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
                                 raise RuntimeError(f"{name}: console command timed out")
 
                             if name == "kernel":
+                                idle_regs = monitor("info registers")
+                                if int(re.search(r"RFL=([0-9a-fA-F]+)", idle_regs)[1], 16) & 0x200 == 0:
+                                    raise RuntimeError("Console did not enable interrupts")
+                                first = command_check(b"ticks\r", b"ticks: ")
+                                time.sleep(0.15)
+                                second = command_check(b"ticks\r", b"ticks: ")
+                                t1 = int(re.search(rb"ticks: (\d+)", first)[1])
+                                t2 = int(re.search(rb"ticks: (\d+)", second)[1])
+                                if not 0 < t1 < t2:
+                                    raise RuntimeError("Timer interrupts did not recur")
                                 command_check(b"help\r\n", b"help  - list commands\r\n")
                                 command_check(b"hex\x08lp\n", b"help  - list commands\r\n")
                                 command_check(b"hex\x7flp\r", b"help  - list commands\r\n")
@@ -154,7 +164,7 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
                             rip = re.search(r"RIP=([0-9a-fA-F]+)", regs)
                             flags = re.search(r"RFL=([0-9a-fA-F]+)", regs)
                             symbols = elf_symbols(kernel)
-                            if expected_exception and rip and "HLT=1" in regs:
+                            if expected_exception and rip and flags and "HLT=1" in regs and int(flags[1], 16) & 0x200 == 0:
                                 if int(rip[1], 16) != symbols["exception_halt"] + 2:
                                     raise RuntimeError(f"{name}: did not reach exception halt")
                                 vector, error, rip_delta, cr2 = expected_exception
@@ -188,6 +198,7 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
                                     b"KERNEL: physical pages ready (4 KiB, self-test passed)\r\n"
                                     b"KERNEL: paging ready (own CR3, RAM check passed)\r\n"
                                     b"KERNEL: dynamic paging checks passed\r\n"
+                                    b"KERNEL: timer ready (PIT, ~100 Hz)\r\n"
                                     b"CONSOLE: ready (type 'help')\r\nK> ")
                                 if kernel_log not in serial.read_bytes():
                                     raise RuntimeError(f"{name}: kernel serial output missing or corrupted")
@@ -209,6 +220,13 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
 
                                 def read_u64(address):
                                     return struct.unpack("<Q", read_memory(address, 8))[0]
+
+                                halted_ticks = read_u64(symbols["ticks"])
+                                time.sleep(0.03)
+                                if halted_ticks == 0 or read_u64(symbols["ticks"]) != halted_ticks:
+                                    raise RuntimeError("Timer missing or halt still accepts interrupts")
+                                if read_u64(symbols["unexpected_irqs"]):
+                                    raise RuntimeError("Unexpected hardware IRQ")
 
                                 for table, symbol, limit in (("GDT", "kernel_gdt", 39), ("IDT", "kernel_idt", 4095)):
                                     descriptor = re.search(rf"{table}=\s*([0-9a-fA-F]+)\s+([0-9a-fA-F]+)", regs)

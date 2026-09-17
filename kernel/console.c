@@ -2,6 +2,7 @@
 #include "serial.h"
 #include "pmm.h"
 #include "main.h"
+#include "timer.h"
 #include "../include/x86.h"
 
 static void output(const char *text)
@@ -32,7 +33,10 @@ static void execute(char *line, unsigned length)
     if (!*line) return;
     if (equal(line, "help")) {
         output("help  - list commands\nmem   - physical page counts (4 KiB)\n"
+               "ticks - timer interrupt count (~100 Hz)\n"
                "clear - clear terminal\nhalt  - stop CPU (restart QEMU to resume)\n");
+    } else if (equal(line, "ticks")) {
+        output("ticks: "); number(timer_ticks()); output("\n");
     } else if (equal(line, "mem")) {
         uint64_t total = pmm_total(), free = pmm_available();
         output("pages: total="); number(total);
@@ -43,6 +47,7 @@ static void execute(char *line, unsigned length)
     } else if (equal(line, "halt")) {
         output("KERNEL: halting\n");
         if (!serial_flush()) x86_spin_forever();
+        x86_disable_interrupts();
         kernel_halt();
     } else {
         output("Unknown command. Type 'help'.\n");
@@ -58,7 +63,7 @@ _Noreturn void console_run(void)
     for (;;) {
         uint8_t byte;
         int status = serial_read(&byte);
-        if (!status) { x86_pause(); continue; }
+        if (!status) { x86_idle(); continue; }
         if (status < 0) { discard = true; escape = 0; continue; }
         if (byte == '\n' && after_cr) { after_cr = false; continue; }
         after_cr = byte == '\r';

@@ -5,6 +5,7 @@
 #include "pmm.h"
 #include "paging.h"
 #include "console.h"
+#include "timer.h"
 
 extern bool pmm_boot_check(void);
 extern bool paging_boot_check(void);
@@ -67,5 +68,10 @@ _Noreturn void kernel_main(const BOOT_INFO *info)
     if (!serial_write("KERNEL: dynamic paging checks passed\n") || !serial_flush()) {
         x86_spin_forever();
     }
+    if (!timer_init() || !timer_check_registers() || !timer_ticks()
+        || !serial_write("KERNEL: timer ready (PIT, ~100 Hz)\n") || !serial_flush()) {
+        x86_spin_forever();
+    }
+    x86_enable_interrupts();
     console_run();
 }

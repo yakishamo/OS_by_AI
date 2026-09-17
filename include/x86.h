@@ -35,6 +35,17 @@ static inline void x86_disable_interrupts(void)
     __asm__ volatile ("cli" : : : "memory");
 }
 
+static inline void x86_enable_interrupts(void)
+{
+    __asm__ volatile ("sti" : : : "memory");
+}
+
+/* Caller must have IF=1 and an enabled interrupt source. */
+static inline void x86_idle(void)
+{
+    __asm__ volatile ("hlt" : : : "memory");
+}
+
 static inline void x86_outb(uint16_t port, uint8_t value)
 {
     __asm__ volatile ("outb %0, %1" : : "a"(value), "Nd"(port) : "memory");
