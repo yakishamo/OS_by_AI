@@ -27,7 +27,7 @@ _Static_assert(sizeof(EXCEPTION_FRAME) == 56, "Exception stack ABI");
 uint64_t kernel_gdt[5] __attribute__((aligned(16)));
 IDT_GATE kernel_idt[256] __attribute__((aligned(16)));
 TSS kernel_tss;
-uint8_t double_fault_stack[16384] __attribute__((aligned(16)));
+uint8_t double_fault_stack[16384] __attribute__((section(".df_stack"), aligned(4096)));
 extern void (*const isr_table[256])(void);
 extern void tables_load(const TABLE_POINTER *, const TABLE_POINTER *);
 extern _Noreturn void exception_halt(void);

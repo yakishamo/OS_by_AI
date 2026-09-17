@@ -80,10 +80,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
         return report_error(system_table, "Serial IO Write", EFI_ERROR(status) ? status : EFI_DEVICE_ERROR);
     }
 
-    /* One owned allocation: information page + 64 KiB map + 64 KiB stack.
+    /* One owned allocation: information + 64 KiB map + guard + 64 KiB stack + guard.
      * All remain EfiLoaderData in the final map; the kernel must retain them.
      */
-    const uintptr_t handoff_pages = 33;
+    const uintptr_t handoff_pages = 35;
     const uintptr_t map_capacity = 16 * 4096;
     uint64_t handoff_base = 0;
     status = services->AllocatePages(0, 2, handoff_pages, &handoff_base);
@@ -100,7 +100,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
     info->memory_map = handoff_base + 4096;
     info->kernel_base = kernel.base;
     info->kernel_size = kernel.pages * 4096;
-    info->stack_base = info->memory_map + map_capacity;
+    info->stack_base = info->memory_map + map_capacity + 4096;
     info->stack_size = 16 * 4096;
 
     /* Only the final GetMemoryMap and ExitBootServices calls follow. */

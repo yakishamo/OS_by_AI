@@ -8,7 +8,7 @@
  * at entry. This header deliberately has no dependency on UEFI interfaces.
  */
 #define BOOT_INFO_MAGIC UINT64_C(0x4f5342494e464f31)
-#define BOOT_INFO_VERSION 1
+#define BOOT_INFO_VERSION 2
 #define BOOT_SERVICES_EXITED UINT64_C(1)
 
 typedef struct {
@@ -22,6 +22,9 @@ typedef struct {
     uint32_t reserved;
     uint64_t kernel_base;
     uint64_t kernel_size;
+    /* Version 2: loader also owns one reserved 4 KiB guard on each side.
+     * stack_base/stack_size describe only the usable stack, not the guards.
+     */
     uint64_t stack_base;
     uint64_t stack_size;
     uint64_t flags;

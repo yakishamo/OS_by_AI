@@ -24,4 +24,15 @@ kernel_halt:
     jmp kernel_halt
 .size kernel_halt, .-kernel_halt
 
+/* QEMU-only fault fixture entry: overflow the real kernel stack into its guard. */
+.section .text,"ax",@progbits
+.global paging_test_stack_overflow
+.type paging_test_stack_overflow,@function
+paging_test_stack_overflow:
+    movq kernel_boot_info(%rip), %rax
+    movq 64(%rax), %rsp
+    pushq %rax
+    ud2
+.size paging_test_stack_overflow, .-paging_test_stack_overflow
+
 .section .note.GNU-stack,"",@progbits

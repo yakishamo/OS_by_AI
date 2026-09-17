@@ -30,7 +30,7 @@ def memory_map(entries):
         for kind, base, pages, attributes in entries))
 
 
-info = Info(0x4f5342494e464f31, 1, 88, 0, 0, 48, 1, 0,
+info = Info(0x4f5342494e464f31, 2, 88, 0, 0, 48, 1, 0,
             0x102001, 4096, 0x106000, 4096, 1)
 address = c.c_uint64(123)
 assert not lib.pmm_alloc(c.byref(address)) and address.value == 123
@@ -54,7 +54,7 @@ entries = [(7, 0xfffff000, 3, 0), (4, 0x108000, 2, 0),
 buffer = memory_map(entries)
 info.memory_map, info.memory_map_size = c.addressof(buffer), len(entries) * 48
 for field, invalid in (("descriptor_size", 39), ("descriptor_version", 2),
-                       ("memory_map_size", 191), ("flags", 0), ("version", 2)):
+                       ("memory_map_size", 191), ("flags", 0), ("version", 1)):
     old = getattr(info, field)
     setattr(info, field, invalid)
     assert not lib.pmm_init(c.byref(info))

@@ -1,4 +1,5 @@
 #include "paging.h"
+#include "layout.h"
 #include "../include/x86.h"
 
 #define ADDRESS_MASK UINT64_C(0x000ffffffffff000)
@@ -33,7 +34,12 @@ static bool map_page(uint64_t address)
         }
         table = (void *)(uintptr_t)(table[index] & ADDRESS_MASK);
     }
-    table[(address >> 12) & 511] = address | FLAGS;
+    uint64_t flags = FLAGS | NX;
+    if (address >= (uintptr_t)kernel_text_start && address < (uintptr_t)kernel_text_end)
+        flags = 1; /* Read/execute, never writable. */
+    else if (address >= (uintptr_t)kernel_rodata_start && address < (uintptr_t)kernel_rodata_end)
+        flags = 1 | NX;
+    table[(address >> 12) & 511] = address | flags;
     return true;
 }
 
@@ -88,6 +94,19 @@ bool paging_init(const BOOT_INFO *info)
         || !mapped_range(info->memory_map, info->memory_map_size)) goto fail;
     for (uint64_t i = 0; i < paging_table_count; ++i)
         if (!mapped_range(table_pages[i], 4096)) goto fail;
+
+    /* Both stacks have separately reserved pages on either side. Verify each
+     * guard is mapped before removing it; no live stack bytes are sacrificed.
+     */
+    const uint64_t guards[] = {info->stack_base - 4096, info->stack_base + info->stack_size,
+        (uintptr_t)double_fault_guard_low, (uintptr_t)double_fault_guard_high};
+    for (unsigned i = 0; i < 4; ++i) {
+        if (!mapped_range(guards[i], 4096)) goto fail;
+        uint64_t *table = (void *)(uintptr_t)paging_root;
+        for (unsigned shift = 39; shift > 12; shift -= 9)
+            table = (void *)(uintptr_t)(table[(guards[i] >> shift) & 511] & ADDRESS_MASK);
+        table[(guards[i] >> 12) & 511] = 0;
+    }
 
     paging_previous_cr3 = x86_read_cr3();
     x86_write_msr(0xc0000080, x86_read_msr(0xc0000080) | (UINT64_C(1) << 11)); /* EFER.NXE */

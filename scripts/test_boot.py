@@ -189,11 +189,11 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
                                 initial_rsp = read_u64(symbols["kernel_initial_rsp"])
                                 observed_rsp = read_u64(symbols["kernel_observed_rsp"])
                                 current_rsp = int(re.search(r"RSP=([0-9a-fA-F]+)", regs)[1], 16)
-                                if (magic != 0x4f5342494e464f31 or version != 1 or info_size != 88
+                                if (magic != 0x4f5342494e464f31 or version != 2 or info_size != 88
                                         or reserved != 0 or boot_flags != 1 or desc_version != 1
                                         or not pointer or pointer % 4096 or mmap != pointer + 4096
                                         or not 0 < mmap_size <= 65536 or stride < 40 or mmap_size % stride
-                                        or stack_size != 65536 or stack_base != mmap + 65536
+                                        or stack_size != 65536 or stack_base != mmap + 65536 + 4096
                                         or initial_rsp != stack_base + stack_size or initial_rsp % 16
                                         or not stack_base <= observed_rsp < initial_rsp
                                         or not stack_base <= current_rsp < initial_rsp):
@@ -223,8 +223,8 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
                                     return False
 
                                 if (not covered(kernel_base, kernel_size, 1)
-                                        or not covered(pointer, 33 * 4096, 2)
-                                        or not (pointer + 33 * 4096 <= low or pointer >= high)):
+                                        or not covered(pointer, 35 * 4096, 2)
+                                        or not (pointer + 35 * 4096 <= low or pointer >= high)):
                                     raise RuntimeError("Kernel / handoff ownership missing from final memory map")
                                 root = read_u64(symbols["paging_root"])
                                 old_cr3 = read_u64(symbols["paging_previous_cr3"])
@@ -241,11 +241,18 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
                                     for index, value in enumerate(entries):
                                         if not value:
                                             continue
-                                        # Permit CPU-updated accessed/dirty bits only.
-                                        if (value & ~0x000ffffffffff000 & ~0x60) != 3:
-                                            raise RuntimeError("Invalid paging flags or unexpected huge page")
                                         physical = value & 0x000ffffffffff000
                                         virtual = prefix | (index << shift)
+                                        expected_flags = 3
+                                        if shift == 12:
+                                            expected_flags = 3 | (1 << 63)
+                                            if symbols["kernel_text_start"] <= virtual < symbols["kernel_text_end"]:
+                                                expected_flags = 1
+                                            elif symbols["kernel_rodata_start"] <= virtual < symbols["kernel_rodata_end"]:
+                                                expected_flags = 1 | (1 << 63)
+                                        # Only accessed/dirty may be changed by the CPU.
+                                        if (value & ~0x000ffffffffff000 & ~0x60) != expected_flags:
+                                            raise RuntimeError("Invalid paging protection or unexpected huge page")
                                         if shift == 12:
                                             if virtual != physical:
                                                 raise RuntimeError("Non-identity mapping")
@@ -260,6 +267,13 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
                                     if kind in (1, 2, 7) and attr & 8 and not attr & (1 << 63):
                                         expected_pages.update(range(max(physical, 0x100000),
                                                                     min(physical + pages * 4096, 1 << 32), 4096))
+                                guards = {stack_base - 4096, stack_base + stack_size,
+                                          symbols["double_fault_guard_low"], symbols["double_fault_guard_high"]}
+                                if (symbols["double_fault_stack"] != symbols["double_fault_guard_low"] + 4096
+                                        or symbols["double_fault_guard_high"] != symbols["double_fault_stack"] + 16384
+                                        or len(guards) != 4 or any(g % 4096 for g in guards)):
+                                    raise RuntimeError("Invalid stack guard layout")
+                                expected_pages -= guards
                                 if mapped != expected_pages or not tables <= mapped:
                                     raise RuntimeError("RAM coverage or reserved-region exclusion mismatch")
                                 if len(tables) != read_u64(symbols["paging_table_count"]):
@@ -365,3 +379,16 @@ def test_all(timeout=60):
         jump = b"\xe9" + struct.pack("<i", symbols[symbol] - symbols["kernel_halt"] - 5)
         run_case(name, fault_image(jump), timeout,
                  expected_exception=(14, error, None, 0xffff800000000000))
+    for name, symbol, vector, error, target in (
+        ("text-write", "paging_test_text_write", 14, 3, symbols["kernel_text_start"]),
+        ("rodata-write", "paging_test_rodata_write", 14, 3, symbols["kernel_rodata_start"]),
+        ("data-exec", "paging_test_data_exec", 14, 17, symbols["nx_data"]),
+        ("stack-exec", "paging_test_stack_exec", 14, 17, None),
+        ("stack-guard-low", "paging_test_stack_low", 14, 0, None),
+        ("stack-guard-high", "paging_test_stack_high", 14, 0, None),
+        ("df-guard-low", "paging_test_df_low", 14, 0, symbols["double_fault_guard_low"]),
+        ("df-guard-high", "paging_test_df_high", 14, 0, symbols["double_fault_guard_high"]),
+        ("stack-overflow", "paging_test_stack_overflow", 8, 0, None),
+    ):
+        jump = b"\xe9" + struct.pack("<i", symbols[symbol] - symbols["kernel_halt"] - 5)
+        run_case(name, fault_image(jump), timeout, expected_exception=(vector, error, None, target))

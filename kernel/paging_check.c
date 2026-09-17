@@ -1,5 +1,8 @@
 #include "../include/x86.h"
 #include "paging.h"
+#include "layout.h"
+
+extern const BOOT_INFO *kernel_boot_info;
 
 static void check_failed(void)
 {
@@ -12,6 +15,11 @@ bool paging_boot_check(void)
     unsigned flags = 123;
     const uint64_t v = PAGING_DYNAMIC_BASE, other = v + 0x200000;
     if (!pmm_alloc(&p) || !pmm_alloc(&q)) return false;
+    /* Kernel and guard frames cannot be aliased through the dynamic API. */
+    if (paging_map(v, (uintptr_t)kernel_text_start, PAGING_WRITE)
+        || paging_map(v, (uintptr_t)kernel_rodata_start, PAGING_WRITE)
+        || paging_map(v, kernel_boot_info->stack_base - 4096, PAGING_WRITE)
+        || paging_map(v, (uintptr_t)double_fault_guard_low, PAGING_WRITE)) return false;
     if (paging_map(0x100000, p, 0) || paging_map(v + 1, p, 0)
         || paging_map(v + PAGING_DYNAMIC_SIZE, p, 0)
         || paging_map(UINT64_C(0x800000000000), p, 0)
@@ -82,3 +90,20 @@ static void fault_check(unsigned mode)
 void paging_test_readonly(void) { fault_check(0); }
 void paging_test_nx(void) { fault_check(1); }
 void paging_test_unmapped(void) { fault_check(2); }
+
+void paging_test_text_write(void) { *(volatile char *)kernel_text_start = 0; check_failed(); }
+void paging_test_rodata_write(void) { *(volatile char *)kernel_rodata_start = 0; check_failed(); }
+static volatile unsigned char nx_data = 0xc3;
+void paging_test_data_exec(void) { ((void (*)(void))(uintptr_t)&nx_data)(); check_failed(); }
+void paging_test_stack_exec(void)
+{
+    volatile unsigned char code = 0xc3;
+    ((void (*)(void))(uintptr_t)&code)();
+    check_failed();
+}
+void paging_test_stack_low(void)
+{ (void)*(volatile char *)(uintptr_t)(kernel_boot_info->stack_base - 4096); check_failed(); }
+void paging_test_stack_high(void)
+{ (void)*(volatile char *)(uintptr_t)(kernel_boot_info->stack_base + kernel_boot_info->stack_size); check_failed(); }
+void paging_test_df_low(void) { (void)*(volatile char *)double_fault_guard_low; check_failed(); }
+void paging_test_df_high(void) { (void)*(volatile char *)double_fault_guard_high; check_failed(); }
