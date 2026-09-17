@@ -54,48 +54,101 @@ static void execute(char *line, unsigned length)
     }
 }
 
+typedef struct {
+    char line[128];
+    unsigned length, escape;
+    bool after_cr, discard;
+} LINE_EDITOR;
+
+static void reset_line(LINE_EDITOR *editor)
+{
+    editor->length = 0;
+    editor->escape = 0;
+    editor->discard = false;
+}
+
+static void finish_line(LINE_EDITOR *editor)
+{
+    output("\n");
+    if (editor->discard) output("Input discarded (line too long or serial error).\n");
+    else execute(editor->line, editor->length);
+    reset_line(editor);
+    output("K> ");
+}
+
+static bool consume_escape(LINE_EDITOR *editor, uint8_t byte)
+{
+    /* Ignore terminal CSI/SS3 keys so arrows cannot become commands. */
+    if (editor->escape == 1) {
+        editor->escape = (byte == '[' || byte == 'O') ? 2 : 0;
+        return true;
+    }
+    if (editor->escape == 2) {
+        if (byte >= 0x40 && byte <= 0x7e) editor->escape = 0;
+        return true;
+    }
+    if (byte != 27) return false;
+    editor->escape = 1;
+    return true;
+}
+
+static void edit_character(LINE_EDITOR *editor, uint8_t byte)
+{
+    if (editor->discard || consume_escape(editor, byte)) return;
+    if (byte == 8 || byte == 127) {
+        if (editor->length) {
+            --editor->length;
+            output("\b \b");
+        }
+        return;
+    }
+    if (byte != '\t' && (byte < 32 || byte > 126)) return;
+    if (editor->length == sizeof(editor->line) - 1) {
+        editor->discard = true;
+        return;
+    }
+    /* Tabs occupy one column, just like other editable characters. */
+    if (byte == '\t') byte = ' ';
+    editor->line[editor->length++] = (char)byte;
+    char echo[] = {(char)byte, 0};
+    output(echo);
+}
+
+static void accept_input(LINE_EDITOR *editor, uint8_t byte)
+{
+    if (byte == '\n' && editor->after_cr) {
+        editor->after_cr = false;
+        return;
+    }
+    editor->after_cr = byte == '\r';
+    if (byte == 3) { /* Ctrl-C also cancels overlong lines and escape sequences. */
+        reset_line(editor);
+        output("^C\nK> ");
+        return;
+    }
+    if (byte == '\r' || byte == '\n') {
+        finish_line(editor);
+        return;
+    }
+    edit_character(editor, byte);
+}
+
 _Noreturn void console_run(void)
 {
-    char line[128];
-    unsigned length = 0, escape = 0;
-    bool after_cr = false, discard = false;
+    LINE_EDITOR editor;
+    reset_line(&editor);
+    editor.after_cr = false;
     output("CONSOLE: ready (type 'help')\nK> ");
     for (;;) {
         uint8_t byte;
         int status = serial_read(&byte);
-        if (!status) { x86_idle(); continue; }
-        if (status < 0) { discard = true; escape = 0; continue; }
-        if (byte == '\n' && after_cr) { after_cr = false; continue; }
-        after_cr = byte == '\r';
-        if (byte == 3) { /* Ctrl-C cancels even an overlong line or escape. */
-            length = escape = 0; discard = false;
-            output("^C\nK> "); continue;
+        if (!status) {
+            x86_idle();
+        } else if (status < 0) {
+            editor.discard = true;
+            editor.escape = 0;
+        } else {
+            accept_input(&editor, byte);
         }
-        if (byte == '\r' || byte == '\n') {
-            output("\n");
-            if (discard) output("Input discarded (line too long or serial error).\n");
-            else execute(line, length);
-            length = escape = 0; discard = false;
-            output("K> "); continue;
-        }
-        if (discard) continue;
-        /* Ignore terminal CSI/SS3 keys so arrows cannot become commands. */
-        if (escape) {
-            if (escape == 1) escape = (byte == '[' || byte == 'O') ? 2 : 0;
-            else if (byte >= 0x40 && byte <= 0x7e) escape = 0;
-            continue;
-        }
-        if (byte == 27) { escape = 1; continue; }
-        if (byte == 8 || byte == 127) {
-            if (length) { --length; output("\b \b"); }
-            continue;
-        }
-        if (byte != '\t' && (byte < 32 || byte > 126)) continue;
-        if (length == sizeof(line) - 1) { discard = true; continue; }
-        /* Normalize tabs to spaces, keeping backspace editing one column wide. */
-        if (byte == '\t') byte = ' ';
-        line[length++] = (char)byte;
-        char echo[] = {(char)byte, 0};
-        output(echo);
     }
 }

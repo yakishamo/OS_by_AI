@@ -25,6 +25,81 @@ static EFI_STATUS report_error(EFI_SYSTEM_TABLE *table, const char *operation, E
     return status;
 }
 
+enum { handoff_pages = 35, map_capacity = 16 * 4096 };
+
+static EFI_STATUS allocate_handoff(EFI_BOOT_SERVICES *services, const LOADED_KERNEL *kernel,
+                                   BOOT_INFO **result)
+{
+    /* One owned allocation: information + 64 KiB map + guard + 64 KiB stack + guard.
+     * All remain EfiLoaderData in the final map; the kernel must retain them.
+     */
+    uint64_t handoff_base = 0;
+    EFI_STATUS status = services->AllocatePages(0, 2, handoff_pages, &handoff_base);
+    if (EFI_ERROR(status)) return status;
+    volatile uint8_t *clear = (void *)(uintptr_t)handoff_base;
+    for (uintptr_t i = 0; i < handoff_pages * 4096; ++i) clear[i] = 0;
+    BOOT_INFO *info = (void *)(uintptr_t)handoff_base;
+    info->magic = BOOT_INFO_MAGIC;
+    info->version = BOOT_INFO_VERSION;
+    info->size = sizeof(*info);
+    info->memory_map = handoff_base + 4096;
+    info->kernel_base = kernel->base;
+    info->kernel_size = kernel->pages * 4096;
+    info->stack_base = info->memory_map + map_capacity + 4096;
+    info->stack_size = 16 * 4096;
+
+    *result = info;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS start_kernel(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_table,
+                               const LOADED_KERNEL *kernel)
+{
+    EFI_BOOT_SERVICES *services = system_table->BootServices;
+    EFI_STATUS status;
+    uintptr_t size;
+    BOOT_INFO *info;
+    status = allocate_handoff(services, kernel, &info);
+    if (EFI_ERROR(status)) {
+        services->FreePages(kernel->base, kernel->pages);
+        return report_error(system_table, "AllocatePages(boot information)", status);
+    }
+
+    /* Only the final GetMemoryMap and ExitBootServices calls follow. */
+    uintptr_t map_key, descriptor_size;
+    uint32_t descriptor_version;
+    for (unsigned attempt = 0; attempt < 8; ++attempt) {
+        size = map_capacity;
+        status = services->GetMemoryMap(&size, (void *)(uintptr_t)info->memory_map, &map_key, &descriptor_size, &descriptor_version);
+        if (EFI_ERROR(status)) {
+            if (attempt == 0) {
+                services->FreePages((uintptr_t)info, handoff_pages);
+                services->FreePages(kernel->base, kernel->pages);
+                return report_error(system_table, "GetMemoryMap", status);
+            }
+            break;
+        }
+        info->memory_map_size = size;
+        info->descriptor_size = descriptor_size;
+        info->descriptor_version = descriptor_version;
+        status = services->ExitBootServices(image_handle, map_key);
+        if (status == EFI_SUCCESS) {
+            info->flags = BOOT_SERVICES_EXITED;
+            typedef void (__attribute__((sysv_abi)) *KERNEL_ENTRY)(const BOOT_INFO *, uint64_t);
+            x86_disable_interrupts();
+            ((KERNEL_ENTRY)(uintptr_t)kernel->entry)(info, info->stack_base + info->stack_size);
+            /* A kernel must never return to retired boot services. */
+            status = EFI_LOAD_ERROR;
+            break;
+        }
+        if (status != EFI_INVALID_PARAMETER) break;
+    }
+    /* After an attempted exit firmware may be partially shut down. */
+    boot_exit_failure = status;
+    x86_disable_interrupts();
+    x86_spin_forever();
+}
+
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_table)
 {
     EFI_BOOT_SERVICES *services = system_table->BootServices;
@@ -80,60 +155,5 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
         return report_error(system_table, "Serial IO Write", EFI_ERROR(status) ? status : EFI_DEVICE_ERROR);
     }
 
-    /* One owned allocation: information + 64 KiB map + guard + 64 KiB stack + guard.
-     * All remain EfiLoaderData in the final map; the kernel must retain them.
-     */
-    const uintptr_t handoff_pages = 35;
-    const uintptr_t map_capacity = 16 * 4096;
-    uint64_t handoff_base = 0;
-    status = services->AllocatePages(0, 2, handoff_pages, &handoff_base);
-    if (EFI_ERROR(status)) {
-        services->FreePages(kernel.base, kernel.pages);
-        return report_error(system_table, "AllocatePages(boot information)", status);
-    }
-    volatile uint8_t *clear = (void *)(uintptr_t)handoff_base;
-    for (uintptr_t i = 0; i < handoff_pages * 4096; ++i) clear[i] = 0;
-    BOOT_INFO *info = (void *)(uintptr_t)handoff_base;
-    info->magic = BOOT_INFO_MAGIC;
-    info->version = BOOT_INFO_VERSION;
-    info->size = sizeof(*info);
-    info->memory_map = handoff_base + 4096;
-    info->kernel_base = kernel.base;
-    info->kernel_size = kernel.pages * 4096;
-    info->stack_base = info->memory_map + map_capacity + 4096;
-    info->stack_size = 16 * 4096;
-
-    /* Only the final GetMemoryMap and ExitBootServices calls follow. */
-    uintptr_t map_key, descriptor_size;
-    uint32_t descriptor_version;
-    for (unsigned attempt = 0; attempt < 8; ++attempt) {
-        size = map_capacity;
-        status = services->GetMemoryMap(&size, (void *)(uintptr_t)info->memory_map, &map_key, &descriptor_size, &descriptor_version);
-        if (EFI_ERROR(status)) {
-            if (attempt == 0) {
-                services->FreePages(handoff_base, handoff_pages);
-                services->FreePages(kernel.base, kernel.pages);
-                return report_error(system_table, "GetMemoryMap", status);
-            }
-            break;
-        }
-        info->memory_map_size = size;
-        info->descriptor_size = descriptor_size;
-        info->descriptor_version = descriptor_version;
-        status = services->ExitBootServices(image_handle, map_key);
-        if (status == EFI_SUCCESS) {
-            info->flags = BOOT_SERVICES_EXITED;
-            typedef void (__attribute__((sysv_abi)) *KERNEL_ENTRY)(const BOOT_INFO *, uint64_t);
-            x86_disable_interrupts();
-            ((KERNEL_ENTRY)(uintptr_t)kernel.entry)(info, info->stack_base + info->stack_size);
-            /* A kernel must never return to retired boot services. */
-            status = EFI_LOAD_ERROR;
-            break;
-        }
-        if (status != EFI_INVALID_PARAMETER) break;
-    }
-    /* After an attempted exit firmware may be partially shut down. */
-    boot_exit_failure = status;
-    x86_disable_interrupts();
-    x86_spin_forever();
+    return start_kernel(image_handle, system_table, &kernel);
 }

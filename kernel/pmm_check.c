@@ -15,9 +15,11 @@ bool pmm_boot_check(void)
         volatile uint64_t *memory = (void *)(uintptr_t)pages[i];
         for (unsigned j = 0; j < 512; ++j) if (memory[j] != (pages[i] ^ j)) return false;
     }
-    if (pmm_available() != before - 3 || pmm_free(pages[0] + 1)
-        || pmm_free(0) || !pmm_free(pages[1]) || pmm_free(pages[1])
-        || !pmm_alloc(&again) || again != pages[1]) return false;
-    return pmm_free(pages[0]) && pmm_free(again) && pmm_free(pages[2])
-        && pmm_available() == before;
+    if (pmm_available() != before - 3) return false;
+    if (pmm_free(pages[0] + 1) || pmm_free(0)) return false;
+    if (!pmm_free(pages[1]) || pmm_free(pages[1])) return false;
+    if (!pmm_alloc(&again) || again != pages[1]) return false;
+    if (!pmm_free(pages[0])) return false;
+    if (!pmm_free(again) || !pmm_free(pages[2])) return false;
+    return pmm_available() == before;
 }

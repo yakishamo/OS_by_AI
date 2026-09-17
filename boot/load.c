@@ -1,4 +1,5 @@
 #include "load.h"
+#include <stdbool.h>
 
 typedef struct {
     uint8_t ident[16];
@@ -15,17 +16,49 @@ typedef struct {
 _Static_assert(sizeof(ELF_HEADER) == 64, "ELF64 header");
 _Static_assert(sizeof(ELF_PROGRAM) == 56, "ELF64 program header");
 
-static EFI_STATUS place_kernel(EFI_BOOT_SERVICES *bs, void *data, uintptr_t size, LOADED_KERNEL *kernel)
+static bool valid_elf_header(const ELF_HEADER *header, uintptr_t size)
 {
-    if (size < sizeof(ELF_HEADER)) return EFI_LOAD_ERROR;
-    const ELF_HEADER *h = data;
-    if (h->ident[0] != 0x7f || h->ident[1] != 'E' || h->ident[2] != 'L' || h->ident[3] != 'F'
-        || h->ident[4] != 2 || h->ident[5] != 1 || h->ident[6] != 1
-        || h->type != 2 || h->machine != 62 || h->version != 1
-        || h->ehsize != sizeof(*h) || h->phentsize != sizeof(ELF_PROGRAM)
-        || h->phnum == 0 || h->phnum > 128 || h->phoff % 8 != 0
-        || h->phoff > size || h->phnum > (size - h->phoff) / sizeof(ELF_PROGRAM))
-        return EFI_LOAD_ERROR;
+    const uint8_t *ident = header->ident;
+    if (ident[0] != 0x7f || ident[1] != 'E' || ident[2] != 'L' || ident[3] != 'F') return false;
+    if (ident[4] != 2 || ident[5] != 1 || ident[6] != 1) return false;
+    if (header->type != 2 || header->machine != 62 || header->version != 1) return false;
+    if (header->ehsize != sizeof(*header) || header->phentsize != sizeof(ELF_PROGRAM)) return false;
+    if (header->phnum == 0 || header->phnum > 128) return false;
+    if (header->phoff % 8 != 0 || header->phoff > size) return false;
+    return header->phnum <= (size - header->phoff) / sizeof(ELF_PROGRAM);
+}
+
+static bool valid_segment(const ELF_PROGRAM *segment, uintptr_t file_size)
+{
+    if (segment->filesz > segment->memsz || segment->offset > file_size) return false;
+    if (segment->filesz > file_size - segment->offset) return false;
+    if (segment->paddr != segment->vaddr) return false;
+    if (segment->vaddr < 0x100000 || segment->vaddr >= 0x100000000ULL) return false;
+    if (segment->memsz > 0x100000000ULL - segment->vaddr) return false;
+    if (segment->align <= 1) return true;
+    if (segment->align & (segment->align - 1)) return false;
+    return segment->vaddr % segment->align == segment->offset % segment->align;
+}
+
+static bool overlaps_previous_segment(const ELF_PROGRAM *programs, unsigned index)
+{
+    const ELF_PROGRAM *current = &programs[index];
+    for (unsigned i = 0; i < index; ++i) {
+        const ELF_PROGRAM *other = &programs[i];
+        if (other->type != 1 || !other->memsz) continue;
+        if (current->vaddr >= other->vaddr + other->memsz) continue;
+        if (other->vaddr < current->vaddr + current->memsz) return true;
+    }
+    return false;
+}
+
+typedef struct {
+    uint64_t base, end;
+} IMAGE_RANGE;
+
+static EFI_STATUS inspect_segments(const ELF_HEADER *h, uintptr_t size, IMAGE_RANGE *range)
+{
+    const void *data = h;
     const ELF_PROGRAM *ph = (const void *)((const uint8_t *)data + h->phoff);
     uint64_t low = UINT64_MAX, high = 0;
     int entry_valid = 0;
@@ -33,17 +66,9 @@ static EFI_STATUS place_kernel(EFI_BOOT_SERVICES *bs, void *data, uintptr_t size
         const ELF_PROGRAM *p = &ph[i];
         if (p->type == 2 || p->type == 3) return EFI_UNSUPPORTED; /* No dynamic linking. */
         if (p->type != 1) continue;
-        if (p->filesz > p->memsz || p->offset > size || p->filesz > size - p->offset
-            || p->paddr != p->vaddr || p->vaddr < 0x100000 || p->vaddr >= 0x100000000ULL
-            || p->memsz > 0x100000000ULL - p->vaddr
-            || (p->align > 1 && ((p->align & (p->align - 1)) != 0
-                || p->vaddr % p->align != p->offset % p->align))) return EFI_LOAD_ERROR;
+        if (!valid_segment(p, size)) return EFI_LOAD_ERROR;
         if (p->memsz == 0) continue;
-        for (unsigned j = 0; j < i; ++j) {
-            const ELF_PROGRAM *q = &ph[j];
-            if (q->type == 1 && q->memsz && p->vaddr < q->vaddr + q->memsz
-                && q->vaddr < p->vaddr + p->memsz) return EFI_LOAD_ERROR;
-        }
+        if (overlaps_previous_segment(ph, i)) return EFI_LOAD_ERROR;
         if ((p->flags & 1) && h->entry >= p->vaddr && h->entry - p->vaddr < p->filesz)
             entry_valid = 1;
         uint64_t begin = p->vaddr & ~4095ULL;
@@ -53,23 +78,56 @@ static EFI_STATUS place_kernel(EFI_BOOT_SERVICES *bs, void *data, uintptr_t size
     }
     /* Bound the initial loader to a 64 MiB image span below 4 GiB. */
     if (!entry_valid || high <= low || high - low > 64 * 1024 * 1024) return EFI_LOAD_ERROR;
-    uint64_t address = low;
-    uintptr_t pages = (high - low) / 4096;
-    EFI_STATUS status = bs->AllocatePages(2, 1, pages, &address); /* AllocateAddress, EfiLoaderCode */
-    if (EFI_ERROR(status)) return status;
-    /* Volatile stores avoid compiler-generated libc calls in this freestanding loader. */
-    volatile uint8_t *memory = (void *)(uintptr_t)address;
-    for (uintptr_t i = 0; i < high - low; ++i) memory[i] = 0;
-    for (unsigned i = 0; i < h->phnum; ++i) {
-        const ELF_PROGRAM *p = &ph[i];
-        if (p->type != 1) continue;
-        volatile uint8_t *dest = (void *)(uintptr_t)p->vaddr;
-        const uint8_t *src = (const uint8_t *)data + p->offset;
-        for (uint64_t j = 0; j < p->filesz; ++j) dest[j] = src[j];
+    range->base = low;
+    range->end = high;
+    return EFI_SUCCESS;
+}
+
+static void copy_segments(const ELF_HEADER *header, const IMAGE_RANGE *range)
+{
+    const uint8_t *data = (const void *)header;
+    const ELF_PROGRAM *programs = (const void *)(data + header->phoff);
+    /* Volatile stores avoid compiler-generated libc calls. */
+    volatile uint8_t *memory = (void *)(uintptr_t)range->base;
+    for (uint64_t i = 0; i < range->end - range->base; ++i) memory[i] = 0;
+    for (unsigned i = 0; i < header->phnum; ++i) {
+        const ELF_PROGRAM *segment = &programs[i];
+        if (segment->type != 1) continue;
+        volatile uint8_t *destination = (void *)(uintptr_t)segment->vaddr;
+        for (uint64_t j = 0; j < segment->filesz; ++j)
+            destination[j] = data[segment->offset + j];
     }
+}
+
+static EFI_STATUS place_kernel(EFI_BOOT_SERVICES *bs, void *data, uintptr_t size, LOADED_KERNEL *kernel)
+{
+    if (size < sizeof(ELF_HEADER)) return EFI_LOAD_ERROR;
+    const ELF_HEADER *header = data;
+    if (!valid_elf_header(header, size)) return EFI_LOAD_ERROR;
+    IMAGE_RANGE range;
+    EFI_STATUS status = inspect_segments(header, size, &range);
+    if (EFI_ERROR(status)) return status;
+    uint64_t address = range.base;
+    uintptr_t pages = (range.end - range.base) / 4096;
+    status = bs->AllocatePages(2, 1, pages, &address); /* AllocateAddress, EfiLoaderCode */
+    if (EFI_ERROR(status)) return status;
+    copy_segments(header, &range);
     kernel->base = address;
     kernel->pages = pages;
-    kernel->entry = h->entry;
+    kernel->entry = header->entry;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS read_entire_file(EFI_FILE_PROTOCOL *file, uint8_t *buffer, uintptr_t length)
+{
+    uintptr_t total = 0;
+    while (total < length) {
+        uintptr_t count = length - total;
+        EFI_STATUS status = file->Read(file, &count, buffer + total);
+        if (EFI_ERROR(status)) return status;
+        if (count == 0 || count > length - total) return EFI_LOAD_ERROR;
+        total += count;
+    }
     return EFI_SUCCESS;
 }
 
@@ -103,15 +161,9 @@ EFI_STATUS load_kernel(EFI_BOOT_SERVICES *bs, EFI_HANDLE image, LOADED_KERNEL *k
     if (EFI_ERROR(status)) goto cleanup;
     status = bs->AllocatePool(2, (uintptr_t)length, &buffer); /* EfiLoaderData */
     if (EFI_ERROR(status)) goto cleanup;
-    uintptr_t total = 0;
-    while (total < length) {
-        uintptr_t count = length - total;
-        status = file->Read(file, &count, (uint8_t *)buffer + total);
-        if (EFI_ERROR(status)) goto cleanup;
-        if (count == 0 || count > length - total) { status = EFI_LOAD_ERROR; goto cleanup; }
-        total += count;
-    }
-    status = place_kernel(bs, buffer, total, kernel);
+    status = read_entire_file(file, buffer, (uintptr_t)length);
+    if (EFI_ERROR(status)) goto cleanup;
+    status = place_kernel(bs, buffer, (uintptr_t)length, kernel);
 cleanup:
     if (buffer) bs->FreePool(buffer);
     if (file) file->Close(file);

@@ -62,19 +62,21 @@ static bool mapped_range(uint64_t base, uint64_t size)
     return true;
 }
 
-bool paging_init(const BOOT_INFO *info)
+static bool supported_cpu_state(uint64_t cr4)
 {
-    if (active || !info || !pmm_total()) return false;
-    uint64_t cr4 = x86_read_cr4(), rflags = x86_read_rflags();
+    uint64_t rflags = x86_read_rflags();
     /* This first implementation supports four levels without PCID. */
     if ((cr4 & ((UINT64_C(1) << 12) | (UINT64_C(1) << 17))) || (rflags & 0x200))
         return false;
     if ((x86_read_msr(0x277) & 255) != 6) return false; /* PAT[0] must be write-back. */
     if (x86_cpuid(0x80000000, 0).eax < 0x80000001) return false;
     if (!(x86_cpuid(0x80000001, 0).edx & (1u << 20))) return false;
-    /* The map has already been validated by pmm_init and remains immutable. */
-    paging_root = new_table();
-    if (!paging_root) return false;
+    return true;
+}
+
+static bool map_boot_ram(const BOOT_INFO *info)
+{
+    /* The map was validated by pmm_init and remains immutable. */
     for (uint64_t offset = 0; offset < info->memory_map_size; offset += info->descriptor_size) {
         const BOOT_MEMORY_DESCRIPTOR *d = (const void *)(uintptr_t)(info->memory_map + offset);
         if ((d->type != 1 && d->type != 2 && d->type != 7)
@@ -84,30 +86,44 @@ bool paging_init(const BOOT_INFO *info)
         if (end > PMM_LIMIT) end = PMM_LIMIT;
         if (begin >= end) continue;
         /* Do not silently treat non-WB memory as ordinary RAM. */
-        if (!(d->attributes & 8)) goto fail;
+        if (!(d->attributes & 8)) return false;
         for (uint64_t page = begin; page < end; page += 4096)
-            if (!map_page(page)) goto fail;
+            if (!map_page(page)) return false;
     }
-    if (!mapped_range(info->kernel_base, info->kernel_size)
-        || !mapped_range(info->stack_base, info->stack_size)
-        || !mapped_range((uintptr_t)info, sizeof(*info))
-        || !mapped_range(info->memory_map, info->memory_map_size)) goto fail;
-    for (uint64_t i = 0; i < paging_table_count; ++i)
-        if (!mapped_range(table_pages[i], 4096)) goto fail;
+    return true;
+}
 
+static bool required_regions_mapped(const BOOT_INFO *info)
+{
+    if (!mapped_range(info->kernel_base, info->kernel_size)) return false;
+    if (!mapped_range(info->stack_base, info->stack_size)) return false;
+    if (!mapped_range((uintptr_t)info, sizeof(*info))) return false;
+    if (!mapped_range(info->memory_map, info->memory_map_size)) return false;
+    for (uint64_t i = 0; i < paging_table_count; ++i)
+        if (!mapped_range(table_pages[i], 4096)) return false;
+    return true;
+}
+
+static bool unmap_stack_guards(const BOOT_INFO *info)
+{
     /* Both stacks have separately reserved pages on either side. Verify each
      * guard is mapped before removing it; no live stack bytes are sacrificed.
      */
     const uint64_t guards[] = {info->stack_base - 4096, info->stack_base + info->stack_size,
         (uintptr_t)double_fault_guard_low, (uintptr_t)double_fault_guard_high};
     for (unsigned i = 0; i < 4; ++i) {
-        if (!mapped_range(guards[i], 4096)) goto fail;
+        if (!mapped_range(guards[i], 4096)) return false;
         uint64_t *table = (void *)(uintptr_t)paging_root;
         for (unsigned shift = 39; shift > 12; shift -= 9)
             table = (void *)(uintptr_t)(table[(guards[i] >> shift) & 511] & ADDRESS_MASK);
         table[(guards[i] >> 12) & 511] = 0;
     }
 
+    return true;
+}
+
+static void activate_page_tables(uint64_t cr4)
+{
     paging_previous_cr3 = x86_read_cr3();
     x86_write_msr(0xc0000080, x86_read_msr(0xc0000080) | (UINT64_C(1) << 11)); /* EFER.NXE */
     x86_write_cr0(x86_read_cr0() | (UINT64_C(1) << 16)); /* Enforce read-only pages at CPL0 too. */
@@ -117,10 +133,28 @@ bool paging_init(const BOOT_INFO *info)
     x86_write_cr3(paging_root);
     x86_write_cr4(cr4);
     active = true;
-    return true;
-fail:
+}
+
+static void discard_page_tables(void)
+{
     while (paging_table_count) pmm_free(table_pages[--paging_table_count]);
     paging_root = 0;
+}
+
+bool paging_init(const BOOT_INFO *info)
+{
+    if (active || !info || !pmm_total()) return false;
+    uint64_t cr4 = x86_read_cr4();
+    if (!supported_cpu_state(cr4)) return false;
+    paging_root = new_table();
+    if (!paging_root) return false;
+    if (!map_boot_ram(info)) goto fail;
+    if (!required_regions_mapped(info)) goto fail;
+    if (!unmap_stack_guards(info)) goto fail;
+    activate_page_tables(cr4);
+    return true;
+fail:
+    discard_page_tables();
     return false;
 }
 

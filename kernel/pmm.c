@@ -36,25 +36,36 @@ static const BOOT_MEMORY_DESCRIPTOR *descriptor(const BOOT_INFO *info, uint64_t 
     return (const void *)(uintptr_t)(info->memory_map + index * info->descriptor_size);
 }
 
-bool pmm_init(const BOOT_INFO *info)
+static bool valid_boot_info(const BOOT_INFO *info)
 {
-    if (ready || !info || info->magic != BOOT_INFO_MAGIC || info->version != BOOT_INFO_VERSION
-        || info->size != sizeof(*info) || info->flags != BOOT_SERVICES_EXITED
-        || !info->memory_map || info->memory_map % 8 || info->descriptor_size < 40
-        || info->descriptor_size % 8 || info->descriptor_version != 1
-        || !valid_range(info->memory_map, info->memory_map_size) || info->memory_map_size > 65536
-        || info->memory_map_size % info->descriptor_size
-        || !valid_range(info->kernel_base, info->kernel_size)
-        || !valid_range(info->stack_base, info->stack_size)
-        || !valid_range((uintptr_t)info, sizeof(*info))) return false;
+    if (!info || info->magic != BOOT_INFO_MAGIC) return false;
+    if (info->version != BOOT_INFO_VERSION || info->size != sizeof(*info)) return false;
+    if (info->flags != BOOT_SERVICES_EXITED) return false;
+    if (!info->memory_map || info->memory_map % 8) return false;
+    if (info->descriptor_size < sizeof(BOOT_MEMORY_DESCRIPTOR)) return false;
+    if (info->descriptor_size % 8 || info->descriptor_version != 1) return false;
+    if (!valid_range(info->memory_map, info->memory_map_size)) return false;
+    if (info->memory_map_size > 65536 || info->memory_map_size % info->descriptor_size) return false;
+    if (!valid_range(info->kernel_base, info->kernel_size)) return false;
+    if (!valid_range(info->stack_base, info->stack_size)) return false;
+    return valid_range((uintptr_t)info, sizeof(*info));
+}
+
+static bool valid_descriptor(const BOOT_MEMORY_DESCRIPTOR *d)
+{
+    if (d->physical_start % PMM_PAGE_SIZE || !d->number_of_pages) return false;
+    return d->number_of_pages <= (UINT64_MAX - d->physical_start) / PMM_PAGE_SIZE;
+}
+
+static bool valid_map_ranges(const BOOT_INFO *info)
+{
     uint64_t count = info->memory_map_size / info->descriptor_size;
     /* Validate the complete map before changing allocator state. Reject overlaps
      * rather than depending on descriptor ordering to resolve conflicting types.
      */
     for (uint64_t i = 0; i < count; ++i) {
         const BOOT_MEMORY_DESCRIPTOR *d = descriptor(info, i);
-        if (d->physical_start % 4096 || !d->number_of_pages
-            || d->number_of_pages > (UINT64_MAX - d->physical_start) / 4096) return false;
+        if (!valid_descriptor(d)) return false;
         uint64_t end = d->physical_start + d->number_of_pages * 4096;
         for (uint64_t j = 0; j < i; ++j) {
             const BOOT_MEMORY_DESCRIPTOR *other = descriptor(info, j);
@@ -62,6 +73,12 @@ bool pmm_init(const BOOT_INFO *info)
                 && other->physical_start < end) return false;
         }
     }
+    return true;
+}
+
+static void mark_usable_pages(const BOOT_INFO *info)
+{
+    uint64_t count = info->memory_map_size / info->descriptor_size;
     /* Both bitmaps start zero in BSS and initialization cannot be repeated. */
     for (uint64_t i = 0; i < count; ++i) {
         const BOOT_MEMORY_DESCRIPTOR *d = descriptor(info, i);
@@ -71,10 +88,22 @@ bool pmm_init(const BOOT_INFO *info)
         if (end > PMM_LIMIT) end = PMM_LIMIT;
         for (uint64_t page = begin / 4096; page < end / 4096; ++page) set(eligible, page);
     }
+}
+
+static void reserve_boot_regions(const BOOT_INFO *info)
+{
     reserve(info->kernel_base, info->kernel_size); /* Includes this allocator's BSS. */
     reserve((uintptr_t)info, sizeof(*info));
     reserve(info->memory_map, info->memory_map_size);
     reserve(info->stack_base, info->stack_size);
+}
+
+bool pmm_init(const BOOT_INFO *info)
+{
+    if (ready || !valid_boot_info(info)) return false;
+    if (!valid_map_ranges(info)) return false;
+    mark_usable_pages(info);
+    reserve_boot_regions(info);
     for (uint64_t page = 0; page < PAGE_COUNT; ++page)
         if (bit(eligible, page)) ++total_pages;
     free_pages = total_pages;

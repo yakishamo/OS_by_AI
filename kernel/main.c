@@ -15,63 +15,79 @@ const BOOT_INFO *kernel_boot_info;
 volatile uint64_t kernel_initial_rsp;
 volatile uint64_t kernel_observed_rsp;
 
+static bool valid_boot_header(const BOOT_INFO *info)
+{
+    if (!info || info->magic != BOOT_INFO_MAGIC) return false;
+    if (info->version != BOOT_INFO_VERSION || info->size != sizeof(*info)) return false;
+    return info->flags == BOOT_SERVICES_EXITED && info->reserved == 0;
+}
+
+static bool valid_memory_map(const BOOT_INFO *info)
+{
+    if (!info->memory_map || !info->memory_map_size) return false;
+    if (info->descriptor_size < sizeof(BOOT_MEMORY_DESCRIPTOR)) return false;
+    if (info->memory_map_size % info->descriptor_size != 0) return false;
+    return info->descriptor_version == 1;
+}
+
+static bool valid_stack(const BOOT_INFO *info, uint64_t rsp)
+{
+    if (info->stack_size < 4096) return false;
+    if (info->stack_base > UINT64_MAX - info->stack_size) return false;
+    uint64_t top = info->stack_base + info->stack_size;
+    if (rsp < info->stack_base || rsp >= top) return false;
+    return kernel_initial_rsp == top && (kernel_initial_rsp & 15) == 0;
+}
+
+static void boot_log(const char *message)
+{
+    if (!serial_write(message) || !serial_flush()) x86_spin_forever();
+}
+
+static _Noreturn void boot_failure(const char *message)
+{
+    serial_write(message);
+    serial_flush();
+    x86_spin_forever();
+}
+
+static void initialize_memory(const BOOT_INFO *info)
+{
+    if (!pmm_init(info) || !pmm_boot_check())
+        boot_failure("KERNEL ERROR: physical page management\n");
+    boot_log("KERNEL: physical pages ready (4 KiB, self-test passed)\n");
+
+    if (!paging_init(info) || !pmm_boot_check())
+        boot_failure("KERNEL ERROR: paging initialization or RAM check\n");
+    boot_log("KERNEL: paging ready (own CR3, RAM check passed)\n");
+
+    if (!paging_boot_check()) boot_failure("KERNEL ERROR: dynamic paging check\n");
+    boot_log("KERNEL: dynamic paging checks passed\n");
+}
+
+static void initialize_timer(void)
+{
+    if (!timer_init()) x86_spin_forever();
+    if (!timer_check_registers() || !timer_ticks()) x86_spin_forever();
+    boot_log("KERNEL: timer ready (PIT, ~100 Hz)\n");
+}
+
 _Noreturn void kernel_main(const BOOT_INFO *info)
 {
+    /* Capture the entry stack here, before calling validation helpers. */
     uint64_t rsp = x86_read_rsp();
     kernel_observed_rsp = rsp;
-    if (!info || info->magic != BOOT_INFO_MAGIC || info->version != BOOT_INFO_VERSION
-        || info->size != sizeof(*info) || info->flags != BOOT_SERVICES_EXITED
-        || !info->memory_map || !info->memory_map_size
-        || info->descriptor_size < sizeof(BOOT_MEMORY_DESCRIPTOR)
-        || info->memory_map_size % info->descriptor_size != 0
-        || info->descriptor_version != 1 || info->reserved != 0
-        || info->stack_size < 4096 || info->stack_base > UINT64_MAX - info->stack_size
-        || rsp < info->stack_base || rsp >= info->stack_base + info->stack_size
-        || kernel_initial_rsp != info->stack_base + info->stack_size
-        || (kernel_initial_rsp & 15) != 0) {
-        /* Failure remains distinguishable from a successful HLT. */
-        x86_spin_forever();
-    }
+    if (!valid_boot_header(info)) x86_spin_forever();
+    if (!valid_memory_map(info) || !valid_stack(info, rsp)) x86_spin_forever();
     kernel_boot_info = info;
-    if (!serial_init()
-        || !serial_write("KERNEL: serial ready (COM1, 115200 8N1)\n"
-                         "KERNEL: boot information verified\n")
-        || !serial_flush()) {
-        /* Failed output must not be mistaken for a successful boot. */
-        x86_spin_forever();
-    }
+
+    if (!serial_init()) x86_spin_forever();
+    boot_log("KERNEL: serial ready (COM1, 115200 8N1)\n"
+             "KERNEL: boot information verified\n");
     tables_init(info->stack_base + info->stack_size);
-    if (!serial_write("KERNEL: GDT/IDT/TSS ready\n") || !serial_flush()) {
-        x86_spin_forever();
-    }
-    if (!pmm_init(info) || !pmm_boot_check()) {
-        serial_write("KERNEL ERROR: physical page management\n");
-        serial_flush();
-        x86_spin_forever();
-    }
-    if (!serial_write("KERNEL: physical pages ready (4 KiB, self-test passed)\n") || !serial_flush()) {
-        x86_spin_forever();
-    }
-    if (!paging_init(info) || !pmm_boot_check()) {
-        serial_write("KERNEL ERROR: paging initialization or RAM check\n");
-        serial_flush();
-        x86_spin_forever();
-    }
-    if (!serial_write("KERNEL: paging ready (own CR3, RAM check passed)\n") || !serial_flush()) {
-        x86_spin_forever();
-    }
-    if (!paging_boot_check()) {
-        serial_write("KERNEL ERROR: dynamic paging check\n");
-        serial_flush();
-        x86_spin_forever();
-    }
-    if (!serial_write("KERNEL: dynamic paging checks passed\n") || !serial_flush()) {
-        x86_spin_forever();
-    }
-    if (!timer_init() || !timer_check_registers() || !timer_ticks()
-        || !serial_write("KERNEL: timer ready (PIT, ~100 Hz)\n") || !serial_flush()) {
-        x86_spin_forever();
-    }
+    boot_log("KERNEL: GDT/IDT/TSS ready\n");
+    initialize_memory(info);
+    initialize_timer();
     x86_enable_interrupts();
     console_run();
 }

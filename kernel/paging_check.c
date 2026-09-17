@@ -9,41 +9,74 @@ static void check_failed(void)
     x86_spin_forever();
 }
 
-bool paging_boot_check(void)
+static bool rejects_invalid_mappings(uint64_t p)
 {
-    uint64_t before = pmm_available(), p, q, result = 123;
+    const uint64_t v = PAGING_DYNAMIC_BASE;
+    uint64_t result = 123;
     unsigned flags = 123;
+    /* Kernel and guard frames cannot be aliased through the dynamic API. */
+    if (paging_map(v, (uintptr_t)kernel_text_start, PAGING_WRITE)) return false;
+    if (paging_map(v, (uintptr_t)kernel_rodata_start, PAGING_WRITE)) return false;
+    if (paging_map(v, kernel_boot_info->stack_base - 4096, PAGING_WRITE)) return false;
+    if (paging_map(v, (uintptr_t)double_fault_guard_low, PAGING_WRITE)) return false;
+    if (paging_map(0x100000, p, 0)) return false;
+    if (paging_map(v + 1, p, 0)) return false;
+    if (paging_map(v + PAGING_DYNAMIC_SIZE, p, 0)) return false;
+    if (paging_map(UINT64_C(0x800000000000), p, 0)) return false;
+    if (paging_map(v, p + 1, 0)) return false;
+    if (paging_map(v, 0, 0)) return false;
+    if (paging_map(v, p, 4)) return false;
+    if (paging_unmap(v)) return false;
+    if (paging_protect(v, 0)) return false;
+    if (paging_query(v, &result, &flags)) return false;
+    if (result != 123) return false;
+    if (flags != 123) return false;
+    return true;
+}
+
+static bool check_aliases_and_permissions(void)
+{
+    uint64_t before = pmm_available(), p, q, result;
+    unsigned flags;
     const uint64_t v = PAGING_DYNAMIC_BASE, other = v + 0x200000;
     if (!pmm_alloc(&p) || !pmm_alloc(&q)) return false;
-    /* Kernel and guard frames cannot be aliased through the dynamic API. */
-    if (paging_map(v, (uintptr_t)kernel_text_start, PAGING_WRITE)
-        || paging_map(v, (uintptr_t)kernel_rodata_start, PAGING_WRITE)
-        || paging_map(v, kernel_boot_info->stack_base - 4096, PAGING_WRITE)
-        || paging_map(v, (uintptr_t)double_fault_guard_low, PAGING_WRITE)) return false;
-    if (paging_map(0x100000, p, 0) || paging_map(v + 1, p, 0)
-        || paging_map(v + PAGING_DYNAMIC_SIZE, p, 0)
-        || paging_map(UINT64_C(0x800000000000), p, 0)
-        || paging_map(v, p + 1, 0) || paging_map(v, 0, 0)
-        || paging_map(v, p, 4) || paging_unmap(v) || paging_protect(v, 0)
-        || paging_query(v, &result, &flags) || result != 123 || flags != 123) return false;
-    if (!paging_map(v, p, PAGING_WRITE) || paging_map(v, q, 0)
-        || !paging_map(other, p, 0)) return false;
+    if (!rejects_invalid_mappings(p)) return false;
+    if (!paging_map(v, p, PAGING_WRITE)) return false;
+    if (paging_map(v, q, 0)) return false;
+    if (!paging_map(other, p, 0)) return false;
     volatile uint64_t *alias = (void *)(uintptr_t)v;
     *alias = UINT64_C(0x123456789abcdef0);
     if (*(volatile uint64_t *)(uintptr_t)p != *alias
         || *(volatile uint64_t *)(uintptr_t)other != *alias) return false;
-    if (!paging_query(v, &result, &flags) || result != p || flags != PAGING_WRITE
-        || !paging_protect(v, 0) || !paging_query(v, &result, &flags) || flags != 0
-        || !paging_protect(v, PAGING_WRITE)) return false;
+    if (!paging_query(v, &result, &flags)) return false;
+    if (result != p) return false;
+    if (flags != PAGING_WRITE) return false;
+    if (!paging_protect(v, 0)) return false;
+    if (!paging_query(v, &result, &flags)) return false;
+    if (flags != 0) return false;
+    if (!paging_protect(v, PAGING_WRITE)) return false;
     *alias = 42; /* A warmed translation must become writable again. */
-    if (!paging_unmap(v) || paging_query(v, &result, &flags) || paging_unmap(v)
-        || !paging_map(v, q, PAGING_WRITE)) return false;
+    if (!paging_unmap(v)) return false;
+    if (paging_query(v, &result, &flags)) return false;
+    if (paging_unmap(v)) return false;
+    if (!paging_map(v, q, PAGING_WRITE)) return false;
     *alias = 99; /* Remapping must discard the previous physical translation. */
     if (*(volatile uint64_t *)(uintptr_t)q != 99 || *(volatile uint64_t *)(uintptr_t)p != 42)
         return false;
-    if (!paging_unmap(v) || !paging_unmap(other) || !pmm_free(p) || !pmm_free(q)
-        || pmm_available() != before) return false;
+    if (!paging_unmap(v)) return false;
+    if (!paging_unmap(other)) return false;
+    if (!pmm_free(p)) return false;
+    if (!pmm_free(q)) return false;
+    if (pmm_available() != before) return false;
 
+    return true;
+}
+
+static bool check_failed_map_cleanup(void)
+{
+    uint64_t before = pmm_available(), p, q, result;
+    unsigned flags;
+    const uint64_t v = PAGING_DYNAMIC_BASE;
     /* Leave only two free pages: creating a fresh dynamic path needs three.
      * Link held pages through their identity mapping, without a large array.
      */
@@ -54,15 +87,24 @@ bool paging_boot_check(void)
         *(uint64_t *)(uintptr_t)q = held;
         held = q;
     }
-    if (paging_map(v, p, PAGING_WRITE) || pmm_available() != 2
-        || paging_query(v, &result, &flags)) return false;
+    if (paging_map(v, p, PAGING_WRITE)) return false;
+    if (pmm_available() != 2) return false;
+    if (paging_query(v, &result, &flags)) return false;
     while (held) {
         q = *(uint64_t *)(uintptr_t)held;
         if (!pmm_free(held)) return false;
         held = q;
     }
-    if (!paging_map(v, p, PAGING_WRITE) || !paging_unmap(v) || !pmm_free(p)) return false;
+    if (!paging_map(v, p, PAGING_WRITE)) return false;
+    if (!paging_unmap(v)) return false;
+    if (!pmm_free(p)) return false;
     return pmm_available() == before;
+}
+
+bool paging_boot_check(void)
+{
+    if (!check_aliases_and_permissions()) return false;
+    return check_failed_map_cleanup();
 }
 
 /* QEMU fixtures jump here instead of kernel_halt. Never called in normal boot. */

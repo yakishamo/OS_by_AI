@@ -379,11 +379,17 @@ kernel/main.h           カーネル入口の宣言
 kernel/linker.ld        ELF64の配置・保護境界・ISTスタックとガード
 kernel/layout.h         リンカが定義するページ境界の宣言
 scripts/check_build.py  生成物の検証
-scripts/test_boot.py    QEMUでのカーネル起動と異常系の検証
+scripts/test_boot.py    QEMU起動監視・コンソール操作・異常系テスト
+scripts/boot_checks.py  起動情報・GDT/IDT・ページテーブルの検証
 scripts/test_pmm.py     合成メモリマップによる物理ページ管理の検証
 scripts/qemu.py         QEMU起動・ファームウェア検出
 Makefile               独立したコンパイル・リンク規則
 ```
+
+検証処理は、入力形式・範囲・重複・所有権など、目的別の関数に分けます。
+依存関係のあるチェックは順序を保ち、サイズ確認前の参照やゼロ除算が起きないようにします。
+初期化の入口は各段階を呼び出す手順に絞り、確保失敗時の後始末は呼び出し側から追える形にします。
+複数の状態変更を長い条件式に詰め込まず、自己テストも検証対象ごとに分けます。
 
 Cコードから使うインラインアセンブラは `include/x86.h` の操作別関数に集約します。
 レジスタ、MSR、CPUID、ポートI/O、割り込み無効化、待機、TLB無効化は `x86_*()` 経由で操作します。
