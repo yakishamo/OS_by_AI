@@ -141,12 +141,18 @@ _Noreturn void console_run(void)
     output("CONSOLE: ready (type 'help')\nK> ");
     for (;;) {
         uint8_t byte;
+        x86_disable_interrupts();
         int status = serial_read(&byte);
         if (!status) {
-            x86_idle();
-        } else if (status < 0) {
+            /* No IRQ can enqueue data between the empty check and STI/HLT. */
+            x86_enable_and_idle();
+            continue;
+        }
+        x86_enable_interrupts();
+        if (status < 0) {
             editor.discard = true;
             editor.escape = 0;
+            editor.after_cr = false;
         } else {
             accept_input(&editor, byte);
         }

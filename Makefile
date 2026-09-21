@@ -17,7 +17,8 @@ BOOT_OBJECTS := $(BUILD)/boot/main.obj $(BUILD)/boot/load.obj
 KERNEL_OBJECTS := $(BUILD)/kernel/entry.o $(BUILD)/kernel/main.o $(BUILD)/kernel/serial.o \
                   $(BUILD)/kernel/tables.o $(BUILD)/kernel/interrupts.o \
                   $(BUILD)/kernel/pmm.o $(BUILD)/kernel/pmm_check.o $(BUILD)/kernel/paging.o \
-                  $(BUILD)/kernel/paging_check.o $(BUILD)/kernel/console.o $(BUILD)/kernel/timer.o
+                  $(BUILD)/kernel/paging_check.o $(BUILD)/kernel/console.o $(BUILD)/kernel/timer.o \
+                  $(BUILD)/kernel/irq.o $(BUILD)/kernel/rx_buffer.o
 OBJECTS := $(BOOT_OBJECTS) $(KERNEL_OBJECTS)
 COMMON_CFLAGS := -std=c17 -ffreestanding -fno-builtin -fno-stack-protector \
                  -mno-red-zone -mgeneral-regs-only -Wall -Wextra -Werror -O2 -g -MMD -MP
@@ -64,9 +65,24 @@ $(BUILD)/pmm-test.so: kernel/pmm.c kernel/pmm.h include/boot_info.h Makefile
 		-fno-stack-protector -Wall -Wextra -Werror -O2 -shared -nostdlib \
 		-fuse-ld=lld kernel/pmm.c $(HOST_PMM_LDFLAGS) -o $@
 
-test: build $(BUILD)/pmm-test.so
+$(BUILD)/rx-test.so: kernel/rx_buffer.c kernel/rx_buffer.h Makefile
+	@mkdir -p $(@D)
+	$(CLANG) --no-default-config -std=c17 -ffreestanding -fno-builtin \
+		-fno-stack-protector -Wall -Wextra -Werror -O2 -shared -nostdlib \
+		-fuse-ld=lld kernel/rx_buffer.c $(HOST_PMM_LDFLAGS) -o $@
+
+$(BUILD)/tests/rx_stalled.o: scripts/fixtures/rx_stalled.c kernel/rx_buffer.h Makefile
+	@mkdir -p $(@D)
+	$(CLANG) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/tests/rx-overflow.elf: $(KERNEL_OBJECTS) $(BUILD)/tests/rx_stalled.o kernel/linker.ld Makefile
+	$(LLD) -flavor gnu -m elf_x86_64 -static -T kernel/linker.ld \
+		--wrap=rx_read -o $@ $(KERNEL_OBJECTS) $(BUILD)/tests/rx_stalled.o
+
+test: build $(BUILD)/pmm-test.so $(BUILD)/rx-test.so $(BUILD)/tests/rx-overflow.elf
 	$(PYTHON) scripts/check_build.py
 	$(PYTHON) scripts/test_pmm.py
+	$(PYTHON) scripts/test_rx_buffer.py
 	$(PYTHON) scripts/qemu.py test
 
 debug: build

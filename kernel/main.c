@@ -88,6 +88,8 @@ _Noreturn void kernel_main(const BOOT_INFO *info)
     boot_log("KERNEL: GDT/IDT/TSS ready\n");
     initialize_memory(info);
     initialize_timer();
+    if (!serial_enable_receive()) boot_failure("KERNEL ERROR: serial receive IRQ\n");
+    boot_log("KERNEL: serial receive ready (IRQ4, 255-byte buffer)\n");
     x86_enable_interrupts();
     console_run();
 }

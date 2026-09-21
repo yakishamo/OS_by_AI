@@ -8,7 +8,7 @@
  */
 bool timer_init(void);
 uint64_t timer_ticks(void);
-void irq_dispatch(uint64_t vector);
+void timer_interrupt(void);
 /* Boot diagnostic: temporarily enable IRQs, verify GPRs and DF/CF survive. */
 bool timer_check_registers(void);
 #endif

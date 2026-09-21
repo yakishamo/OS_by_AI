@@ -102,6 +102,7 @@ def check_successful_boot(name, kernel, symbols, regs, monitor, serial, log_dir,
         b"KERNEL: paging ready (own CR3, RAM check passed)\r\n"
         b"KERNEL: dynamic paging checks passed\r\n"
         b"KERNEL: timer ready (PIT, ~100 Hz)\r\n"
+        b"KERNEL: serial receive ready (IRQ4, 255-byte buffer)\r\n"
         b"CONSOLE: ready (type 'help')\r\nK> ")
     if kernel_log not in serial.read_bytes():
         raise RuntimeError(f"{name}: kernel serial output missing or corrupted")
@@ -130,6 +131,8 @@ def check_successful_boot(name, kernel, symbols, regs, monitor, serial, log_dir,
         raise RuntimeError("Timer missing or halt still accepts interrupts")
     if read_u64(symbols["unexpected_irqs"]):
         raise RuntimeError("Unexpected hardware IRQ")
+    if not read_u64(symbols["serial_rx_interrupts"]):
+        raise RuntimeError("No UART receive interrupt delivered")
 
     check_descriptor_tables(regs, symbols, read_memory)
     pointer = read_u64(symbols["kernel_boot_info"])

@@ -46,6 +46,24 @@ static inline void x86_idle(void)
     __asm__ volatile ("hlt" : : : "memory");
 }
 
+static inline uint64_t x86_irq_save(void)
+{
+    uint64_t flags = x86_read_rflags();
+    x86_disable_interrupts();
+    return flags;
+}
+
+static inline void x86_irq_restore(uint64_t flags)
+{
+    if (flags & 0x200) x86_enable_interrupts();
+}
+
+/* Enable and sleep atomically relative to maskable interrupt delivery. */
+static inline void x86_enable_and_idle(void)
+{
+    __asm__ volatile ("sti; hlt" : : : "memory");
+}
+
 static inline void x86_outb(uint16_t port, uint8_t value)
 {
     __asm__ volatile ("outb %0, %1" : : "a"(value), "Nd"(port) : "memory");

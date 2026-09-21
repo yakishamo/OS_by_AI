@@ -65,6 +65,7 @@ KERNEL: physical pages ready (4 KiB, self-test passed)
 KERNEL: paging ready (own CR3, RAM check passed)
 KERNEL: dynamic paging checks passed
 KERNEL: timer ready (PIT, ~100 Hz)
+KERNEL: serial receive ready (IRQ4, 255-byte buffer)
 CONSOLE: ready (type 'help')
 K>
 ```
@@ -91,24 +92,31 @@ BackspaceとDeleteで末尾を削除し、Ctrl-Cで入力を取り消します�
 長すぎる行とUART受信エラーが起きた行は、Enterまで破棄してからエラーを表示します。
 未知のコマンドや引数付きのコマンドは実行しません。ファイル操作や外部プログラムの起動機能はありません。
 
-初期化後はタイマー割り込みを有効にします。入力がない間はHLTで待機し、約10 msごとのタイマーで起床してUARTを確認します。
-UARTの受信割り込みはまだ使用しません。`halt` は割り込みを無効にしてから停止します。
+初期化後はタイマーIRQ0とシリアル受信IRQ4を有効にします。入力がない間はHLTで待機し、受信割り込みで起床します。
+空き確認を割り込み無効で行い、`sti; hlt`で有効化と待機を連続させ、入力到着との競合を防ぎます。
+`halt` は割り込みを無効にしてから停止します。
 フロー制御は未実装のため、大量の貼り付けはUARTの受信容量を超える場合があります。
 
 ## カーネルのシリアル入出力
 
 `kernel/serial.c` はQEMU PCのCOM1（I/Oポート `0x3f8`）を直接操作します。
-UEFIのプロトコルや割り込みには依存しません。設定は115200 baud / 8N1、FIFO有効、UART割り込み無効です。
+UEFIのプロトコルには依存しません。設定は115200 baud / 8N1、FIFO有効です。送信はポーリング、受信はIRQ4を使います。
 
 - `serial_init()`：ローダーの残りの送信を待ち、UARTを初期化。
 - `serial_write()`：送信可能になるまでポーリングし、文字列を出力。LFはCRLFへ変換。
 - `serial_flush()`：FIFOとシフトレジスターの両方が空になるまで待機。
-- `serial_read(&byte)`：非ブロッキングの受信。1は受信成功、0は入力なし、-1は受信エラーです。
+- `serial_enable_receive()`：PIC初期化後に、OUT2と受信・ライン状態割り込みを有効化。呼び出し時はIF=0が必要です。
+- `serial_read(&byte)`：リングバッファからの非ブロッキング読み取り。1は受信成功、0は入力なし、-1は受信データ喪失です。呼び出し時はIF=0が必要です。
+- `serial_interrupt()`：UARTの割り込み要因を確認し、FIFOから受信バッファへ転送。PICへのEOIは共通IRQ処理が担当します。
 
 出力用関数は成功・失敗をboolで返します。ポーリングには回数上限を設けていますが、
 タイマーのtickはこの回数制限に使用しておらず、実時間のタイムアウトではありません。
 出力失敗時はPAUSEループに入り、正常なHLT到達として扱いません。
-現在は単一CPU向けで、UARTの受信・送信割り込みと複数CPU間の排他制御は未実装です。
+受信バッファは256バイトの固定配列で、実容量は255バイトです。単一CPU・割り込み禁止区間で保護し、IRQ内では確保やログ出力をしません。
+バッファ超過やUART受信エラーが起きた場合、キューを破棄してエラーを記録します。読み取り側に-1を返すまで新規入力を捨て、
+コンソールはその行をEnterまで破棄します。Enter自体が失われた場合はもう一度Enter、またはCtrl-Cで復帰できます。
+割り込み処理にも回数上限を設け、上限到達時は受信FIFOだけをクリアします。送信待ちデータは保持します。
+送信割り込み、フロー制御、複数CPU間の排他制御は未実装です。
 
 ## カーネル読み込みの手順と範囲
 
@@ -180,11 +188,10 @@ NMI専用スタックと再入可能なログ出力は今後の段階です。
 
 ## タイマー割り込み
 
-`kernel/timer.c` はQEMU q35 / 1 CPU向けに、レガシーPICとPITを設定します。
+`kernel/irq.c` はQEMU q35 / 1 CPU向けのPIC初期化・IRQ配送を担当し、`kernel/timer.c` はPITとtickを担当します。
 ローカルAPICを無効化してPICからの直接配送を使い、IRQ0〜15をベクター32〜47へ移します。
 x2APICが有効な構成は拒否し、IOAPIC・ローカルAPICタイマー・SMPにはまだ対応しません。
-PIT channel 0をmode 2、分周値11932に設定し、約100 HzのIRQ0だけを許可します。
-ほかのPIC IRQはマスクします。
+PIT channel 0をmode 2、分周値11932に設定し、約100 HzのIRQ0を許可します。続いてシリアル初期化がIRQ4を許可し、ほかのPIC IRQはマスクします。
 
 IRQ入口は全汎用レジスターを保存し、DFをクリアしてスタックを16バイト整列させてからCを呼びます。
 IRQ0は64ビットtickを増やしてPICへEOIを送り、IRETQで元のレジスター・RFLAGS・スタックへ復帰します。
@@ -276,7 +283,7 @@ NX対応CPUを要求し、EFER.NXEとCR0.WPを有効にして動的マッピン�
 macOSではCommand Line ToolsのSDKを使用します。別の配置なら `HOST_SDK` で指定できます。
 標準の `make` がXcodeライセンス確認で起動できない環境では、Homebrewの `gmake test` / `gmake run` を使えます。
 
-`make test` は生成物の検証に加え、次の24ケースをQEMUで逐次実行します。
+`make test` は生成物の検証に加え、次の25ケースをQEMUで逐次実行します。
 
 - 本物の `kernel.elf` を起動し、コンソールを操作後に `halt` を入力して、`kernel_halt`でのRIP、`HLT=1`、`IF=0`、RIP直前のHLT命令、および動的ページ管理テスト成功を含むコンソール起動までのシリアルログをCRLFも含めて確認。
 - カーネルファイルの欠落、ELF識別子の破損、ファイル範囲外のセグメント、無効な入口を拒否。
@@ -305,10 +312,14 @@ GDTR・IDTR・セグメントセレクター・TR、およびIDT全256エント�
 QMPはパイプ経由、シリアル入力は一時ディレクトリ内の名前付きパイプ経由で接続し、ネットワークポートは使いません。
 通常起動テストでは割り込み有効状態、`ticks`の増加、`halt`後のtick停止、予期しないIRQがないことも検証します。
 通常起動テストでは全コマンド、CR/LF/CRLF、Backspace/Delete、空行、Ctrl-C、未知のコマンド、127文字境界と超過後の復帰も検証します。
-UARTの受信FIFOをあふれさせないよう、テスト入力は1文字ずつ間隔を空けて送信します。
+通常の行編集テストは1文字ずつ送信し、連続入力テストでは16コマンドを間隔なしで送信します。
+追加の `rx-overflow` ケースでは、テスト専用ELFのリンカラッパーで読み取り側を一時停止し、実際のIRQ4で256バイトを受信させます。
+バッファ超過、行の破棄、通常コマンドへの復帰を確認します。UARTハンドラーと受信バッファ本体は通常ビルドと同じです。
+`test_rx_buffer.py` ではバッファの循環、容量境界、エラー通知と復帰も検証します。
 各ケースの制限時間は60秒です。全体を同時実行せず、逐次実行してください。
 
 ```sh
+gmake build/tests/rx-overflow.elf  # 直接実行する場合もテスト専用ELFを先に用意
 python3 scripts/qemu.py test --timeout 120
 ```
 
@@ -360,14 +371,18 @@ include/boot_info.h      ローダーとカーネルの共通起動情報ABI
 include/x86.h            x86命令を操作ごとに関数化した共通ヘッダー
 kernel/entry.S          専用スタックへの切り替えとC入口への移行
 kernel/main.c           起動情報の確認と最小カーネル
-kernel/serial.c         カーネル用COM1ポーリング入出力
+kernel/serial.c         COM1ポーリング送信・IRQ受信
+kernel/rx_buffer.c      受信リングバッファ
+kernel/rx_buffer.h      受信バッファAPI
 kernel/serial.h         シリアル入出力のインターフェース
 kernel/console.c        行編集とデバッグコマンド
 kernel/console.h        コンソール入口
 kernel/tables.c         GDT・IDT・TSS構築と例外診断
 kernel/tables.h         テーブル初期化と例外フレームの定義
 kernel/interrupts.S     テーブル切り替え・例外/IRQ入口・レジスター保存の自己テスト
-kernel/timer.c          PIC/PIT初期化とIRQ処理
+kernel/irq.c            PIC初期化・共通IRQ配送
+kernel/irq.h            PIC/IRQのAPI
+kernel/timer.c          PIT初期化とtick管理
 kernel/timer.h          タイマーAPI
 kernel/pmm.c            物理ページの管理・確保・解放
 kernel/pmm.h            物理ページ管理API
@@ -382,6 +397,9 @@ scripts/check_build.py  生成物の検証
 scripts/test_boot.py    QEMU起動監視・コンソール操作・異常系テスト
 scripts/boot_checks.py  起動情報・GDT/IDT・ページテーブルの検証
 scripts/test_pmm.py     合成メモリマップによる物理ページ管理の検証
+scripts/test_rx_buffer.py  受信バッファ単体検証
+scripts/serial_checks.py   シリアル入出力・連続受信テスト
+scripts/fixtures/rx_stalled.c  超過テスト用の読み取り停止ラッパー
 scripts/qemu.py         QEMU起動・ファームウェア検出
 Makefile               独立したコンパイル・リンク規則
 ```
@@ -396,7 +414,7 @@ Cコードから使うインラインアセンブラは `include/x86.h` の操�
 RSP取得は呼び出し元のスタックを測定するため、常にインライン展開します。
 スタック切り替えや例外入口など、既存の `.S` ファイル内の処理は引き続きアセンブリ関数として扱います。
 
-次の段階では、UARTの受信割り込みと入力バッファなどを小さく追加していきます。
+次の段階では、カーネル内タスクの協調的な切り替えなどを小さく追加していきます。
 
 ## 参照資料
 

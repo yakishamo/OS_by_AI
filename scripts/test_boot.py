@@ -12,6 +12,7 @@ import time
 
 import qemu
 from boot_checks import check_successful_boot
+from serial_checks import SerialClient, check_receive_bursts, check_receive_overflow
 
 
 def elf_symbols(data):
@@ -112,6 +113,7 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
             command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors
         ) as process:
             connection = None
+            serial_client = None
             try:
                 with selectors.DefaultSelector() as selector:
                     selector.register(process.stdout, selectors.EVENT_READ)
@@ -157,27 +159,13 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
                         if not console_driven and b"CONSOLE: ready (type 'help')\r\nK> " in transcript:
                             connection = os.fdopen(os.open(str(serial_pipe) + ".in", os.O_RDWR | os.O_NONBLOCK), "wb", buffering=0)
 
-                            def send(data):
-                                # Respect the polled UART's small receive FIFO, including echo time.
-                                for byte in data:
-                                    connection.write(bytes([byte]))
-                                    time.sleep(0.003)
-
-                            def command_check(data, expected):
-                                start = len(serial.read_bytes())
-                                send(data)
-                                while time.monotonic() < deadline:
-                                    reply = serial.read_bytes()[start:]
-                                    if reply.endswith(b"K> "):
-                                        if expected not in reply or reply.count(b"K> ") != 1:
-                                            raise RuntimeError(f"{name}: console reply mismatch: {reply!r}")
-                                        return reply
-                                    time.sleep(0.01)
-                                raise RuntimeError(f"{name}: console command timed out")
-
+                            serial_client = SerialClient(connection, str(serial_pipe) + ".out", serial, deadline)
                             if name == "kernel":
-                                check_console(monitor, command_check)
-                            send(b"halt\r")
+                                check_console(monitor, serial_client.command)
+                                check_receive_bursts(serial_client, monitor, elf_symbols(kernel))
+                            elif name == "rx-overflow":
+                                check_receive_overflow(serial_client, monitor, elf_symbols(kernel))
+                            serial_client.send(b"halt\r")
                             console_driven = True
                             continue
                         if re.search(rb"BOOT ERROR:[^\r\n]*\r\n", transcript):
@@ -205,6 +193,8 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
                         time.sleep(0.1)
                     raise RuntimeError(f"{name}: timeout; logs in {log_dir}")
             finally:
+                if serial_client is not None:
+                    serial_client.close()
                 if connection is not None:
                     connection.close()
                 qemu.stop(process)
@@ -213,6 +203,8 @@ def run_case(name, kernel, timeout, expected_error=None, memory_checks=(), expec
 def test_all(timeout=60):
     original = (qemu.BUILD / "esp/kernel.elf").read_bytes()
     run_case("kernel", original, timeout)
+    overflow_kernel = (qemu.BUILD / "tests/rx-overflow.elf").read_bytes()
+    run_case("rx-overflow", overflow_kernel, timeout)
     run_case("missing", None, timeout, b"load kernel.elf status=0x800000000000000e")
     bad_magic = bytearray(original)
     bad_magic[0] = 0
